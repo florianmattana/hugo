@@ -1,0 +1,61 @@
+baseURL: "https://florianmattana.com/"
+title: "Florian Mattana"
+paginate: 10
+theme: PaperMod
+
+enableRobotsTXT: true
+buildDrafts: false
+buildFuture: false
+buildExpired: false
+
+minify:
+  disableXML: true
+  minifyOutput: true
+
+params:
+  env: production
+  title: "Florian Mattana"
+  description: "From naive GEMM to Flash Attention — implementing and profiling GPU kernels in CUDA, documented step by step."
+  author: "Florian Mattana"
+  defaultTheme: auto
+  disableThemeToggle: false
+  ShowReadingTime: true
+  ShowShareButtons: false
+  ShowPostNavLinks: true
+  ShowBreadCrumbs: true
+  ShowCodeCopyButtons: true
+  ShowWordCount: true
+  UseHugoToc: true
+  showtoc: true
+  tocopen: true
+
+  homeInfoParams:
+    Title: "Florian Mattana"
+    Content: "CUDA engineer. Building GPU kernels from scratch and writing about it."
+
+  socialIcons:
+    - name: github
+      url: "https://github.com/florianmattana"
+
+menu:
+  main:
+    - identifier: posts
+      name: Posts
+      url: /posts/
+      weight: 10
+    - identifier: tags
+      name: Tags
+      url: /tags/
+      weight: 20
+
+pygmentsUseClasses: true
+markup:
+  highlight:
+    noClasses: false
+    codeFences: true
+    guessSyntax: true
+    lineNos: false
+    style: monokai
+  goldmark:
+    renderer:
+      unsafe: true
