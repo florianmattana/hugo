@@ -49,9 +49,9 @@ params:
     - name: linkedin
       url: "https://linkedin.com/in/florianmattana"
     - name: x
-      url: "https://x.com/florianmattana"
+      url: "https://x.com/florian_mattana"
     - name: email
-      url: "mailto:florian@florianmattana.com"
+      url: "mailto:mattana.florian@gmail.com"
 
   cover:
     linkFullImages: true
