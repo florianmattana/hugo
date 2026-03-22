@@ -15,12 +15,13 @@ minify:
 params:
   env: production
   title: "Florian Mattana"
-  description: "From naive GEMM to Flash Attention — implementing and profiling GPU kernels in CUDA, documented step by step."
+  description: "GPU Performance Engineer. Building GPU kernels from scratch and writing about it."
   author: "Florian Mattana"
-  defaultTheme: auto
+  defaultTheme: dark
   disableThemeToggle: false
   ShowReadingTime: true
-  ShowShareButtons: false
+  ShowShareButtons: true
+  ShareButtons: ["linkedin", "x", "email"]
   ShowPostNavLinks: true
   ShowBreadCrumbs: true
   ShowCodeCopyButtons: true
@@ -28,25 +29,70 @@ params:
   UseHugoToc: true
   showtoc: true
   tocopen: true
+  hideFooter: false
 
-  homeInfoParams:
-    Title: "Florian Mattana"
-    Content: "CUDA engineer. Building GPU kernels from scratch and writing about it."
+  profileMode:
+    enabled: true
+    title: "Florian Mattana"
+    subtitle: "CUDA/C++ engineer. Building GPU kernels from scratch and writing about it."
+    buttons:
+      - name: Blog
+        url: /posts/
+      - name: About
+        url: /about/
+      - name: GitHub
+        url: "https://github.com/florianmattana"
 
   socialIcons:
     - name: github
-      url: "https://florianmattana.com"
+      url: "https://github.com/florianmattana"
+    - name: linkedin
+      url: "https://linkedin.com/in/florianmattana"
+    - name: x
+      url: "https://x.com/florianmattana"
+    - name: email
+      url: "mailto:florian@florianmattana.com"
+
+  cover:
+    linkFullImages: true
+    responsiveImages: true
+
+  assets:
+    disableFingerprinting: false
+
+  fuseOpts:
+    isCaseSensitive: false
+    shouldSort: true
+    location: 0
+    distance: 1000
+    threshold: 0.4
+    minMatchCharLength: 0
+    keys: ["title", "permalink", "summary", "content"]
 
 menu:
   main:
-    - identifier: posts
-      name: Posts
+    - identifier: blog
+      name: Blog
       url: /posts/
       weight: 10
     - identifier: tags
       name: Tags
       url: /tags/
       weight: 20
+    - identifier: search
+      name: Search
+      url: /search/
+      weight: 30
+    - identifier: about
+      name: About
+      url: /about/
+      weight: 40
+
+outputs:
+  home:
+    - HTML
+    - RSS
+    - JSON
 
 pygmentsUseClasses: true
 markup:
@@ -55,7 +101,8 @@ markup:
     codeFences: true
     guessSyntax: true
     lineNos: false
-    style: monokai
+    style: dracula
+    anchorLineNos: false
   goldmark:
     renderer:
       unsafe: true
