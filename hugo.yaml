@@ -34,7 +34,7 @@ params:
   profileMode:
     enabled: true
     title: "Florian Mattana"
-    subtitle: "CUDA/C++ engineer. Building GPU kernels from scratch and writing about it."
+    subtitle: "GPU Performance Engineer. Building GPU kernels from scratch and writing about it."
     buttons:
       - name: Blog
         url: /posts/
