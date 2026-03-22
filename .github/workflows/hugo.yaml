@@ -47,7 +47,7 @@ jobs:
           hugo build \
             --gc \
             --minify \
-            --baseURL "${{ steps.pages.outputs.base_url }}/"
+            --baseURL "https://florianmattana.com/"
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
