@@ -1,6 +1,6 @@
 ---
 title: "From Silicon to Thread Identity: How CUDA Threads Know Who They Are"
-date: 2026-01-20
+date: 2026-02-13
 draft: false
 tags: ["cuda", "ptx", "gpu-architecture", "registers"]
 description: "How threadIdx, blockIdx and blockDim are hardware registers, not software functions, and what that means for performance."
