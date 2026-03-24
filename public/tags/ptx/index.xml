@@ -1,20 +1,13 @@
 <?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/">
   <channel>
-    <title>Cuda on Florian Mattana</title>
-    <link>http://localhost:1313/tags/cuda/</link>
-    <description>Recent content in Cuda on Florian Mattana</description>
+    <title>Ptx on Florian Mattana</title>
+    <link>http://localhost:1313/tags/ptx/</link>
+    <description>Recent content in Ptx on Florian Mattana</description>
     <generator>Hugo</generator>
     <language>en</language>
-    <lastBuildDate>Tue, 17 Mar 2026 00:00:00 +0000</lastBuildDate>
-    <atom:link href="http://localhost:1313/tags/cuda/index.xml" rel="self" type="application/rss+xml" />
-    <item>
-      <title>Building an FP4 Fused Attention Kernel on Consumer Blackwell (SM120) (WIP)</title>
-      <link>http://localhost:1313/posts/fp4-fused-attention-kernel-sm120/</link>
-      <pubDate>Tue, 17 Mar 2026 00:00:00 +0000</pubDate>
-      <guid>http://localhost:1313/posts/fp4-fused-attention-kernel-sm120/</guid>
-      <description>A deep dive into writing a fused FP4 attention kernel for the RTX 5070 Ti, using inline PTX and warp-level MMA instructions.</description>
-    </item>
+    <lastBuildDate>Fri, 13 Feb 2026 00:00:00 +0000</lastBuildDate>
+    <atom:link href="http://localhost:1313/tags/ptx/index.xml" rel="self" type="application/rss+xml" />
     <item>
       <title>From Silicon to Thread Identity: How CUDA Threads Know Who They Are</title>
       <link>http://localhost:1313/posts/from-silicon-to-thread-identity/</link>

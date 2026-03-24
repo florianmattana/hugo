@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Registers on Florian Mattana</title>
+    <link>http://localhost:1313/tags/registers/</link>
+    <description>Recent content in Registers on Florian Mattana</description>
+    <generator>Hugo</generator>
+    <language>en</language>
+    <lastBuildDate>Fri, 13 Feb 2026 00:00:00 +0000</lastBuildDate>
+    <atom:link href="http://localhost:1313/tags/registers/index.xml" rel="self" type="application/rss+xml" />
+    <item>
+      <title>From Silicon to Thread Identity: How CUDA Threads Know Who They Are</title>
+      <link>http://localhost:1313/posts/from-silicon-to-thread-identity/</link>
+      <pubDate>Fri, 13 Feb 2026 00:00:00 +0000</pubDate>
+      <guid>http://localhost:1313/posts/from-silicon-to-thread-identity/</guid>
+      <description>How threadIdx, blockIdx and blockDim are hardware registers, not software functions, and what that means for performance.</description>
+    </item>
+  </channel>
+</rss>

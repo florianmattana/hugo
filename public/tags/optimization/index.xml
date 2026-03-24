@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Optimization on Florian Mattana</title>
+    <link>http://localhost:1313/tags/optimization/</link>
+    <description>Recent content in Optimization on Florian Mattana</description>
+    <generator>Hugo</generator>
+    <language>en</language>
+    <lastBuildDate>Thu, 15 Jan 2026 00:00:00 +0000</lastBuildDate>
+    <atom:link href="http://localhost:1313/tags/optimization/index.xml" rel="self" type="application/rss+xml" />
+    <item>
+      <title>Exploring PTX: A Close Look at Tile Optimization in CUDA</title>
+      <link>http://localhost:1313/posts/exploring-ptx-tile-optimization/</link>
+      <pubDate>Thu, 15 Jan 2026 00:00:00 +0000</pubDate>
+      <guid>http://localhost:1313/posts/exploring-ptx-tile-optimization/</guid>
+      <description>Comparing naive and tiled matrix transpose kernels at the PTX level to understand shared memory, coalescing, and bank conflicts.</description>
+    </item>
+  </channel>
+</rss>

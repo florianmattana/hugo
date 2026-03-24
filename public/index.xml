@@ -9,11 +9,25 @@
     <lastBuildDate>Tue, 17 Mar 2026 00:00:00 +0000</lastBuildDate>
     <atom:link href="http://localhost:1313/index.xml" rel="self" type="application/rss+xml" />
     <item>
-      <title>Building an FP4 Fused Attention Kernel on Consumer Blackwell (SM120)</title>
+      <title>Building an FP4 Fused Attention Kernel on Consumer Blackwell (SM120) (WIP)</title>
       <link>http://localhost:1313/posts/fp4-fused-attention-kernel-sm120/</link>
       <pubDate>Tue, 17 Mar 2026 00:00:00 +0000</pubDate>
       <guid>http://localhost:1313/posts/fp4-fused-attention-kernel-sm120/</guid>
       <description>A deep dive into writing a fused FP4 attention kernel for the RTX 5070 Ti, using inline PTX and warp-level MMA instructions.</description>
+    </item>
+    <item>
+      <title>From Silicon to Thread Identity: How CUDA Threads Know Who They Are</title>
+      <link>http://localhost:1313/posts/from-silicon-to-thread-identity/</link>
+      <pubDate>Fri, 13 Feb 2026 00:00:00 +0000</pubDate>
+      <guid>http://localhost:1313/posts/from-silicon-to-thread-identity/</guid>
+      <description>How threadIdx, blockIdx and blockDim are hardware registers, not software functions, and what that means for performance.</description>
+    </item>
+    <item>
+      <title>Exploring PTX: A Close Look at Tile Optimization in CUDA</title>
+      <link>http://localhost:1313/posts/exploring-ptx-tile-optimization/</link>
+      <pubDate>Thu, 15 Jan 2026 00:00:00 +0000</pubDate>
+      <guid>http://localhost:1313/posts/exploring-ptx-tile-optimization/</guid>
+      <description>Comparing naive and tiled matrix transpose kernels at the PTX level to understand shared memory, coalescing, and bank conflicts.</description>
     </item>
   </channel>
 </rss>
