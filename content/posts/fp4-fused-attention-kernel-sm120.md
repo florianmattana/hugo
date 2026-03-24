@@ -220,4 +220,127 @@ On SM120, each scale factor covers a block of 32 elements along the K dimension.
 
 The kernel now has three validated building blocks: `encode_fp4_e2m1`, `compute_scale_ue8m0`, and the inline PTX MMA call. The next step is loading Q, K, V tiles into shared memory with async copies (`cp.async`) and wiring everything together into the fused attention loop.
 
+## 7. Assembling the Kernel: Where Things Got Real
+
+The three building blocks worked in isolation. Encoding, scaling, MMA, all validated with hardcoded test values. Now I had to wire them together into an actual kernel that loads real data from VRAM, quantizes it on the fly, and runs the Tensor Core multiply. This is where the gap between "I have working pieces" and "I have a working kernel" became very real.
+
+### The first decision: how much shared memory
+
+My first attempt allocated two separate FP32 buffers in shared memory, one for Q and one for K. Each tile is 64 tokens times 128 dimensions = 8192 floats = 32 KB. Two of them: 64 KB. Add the quantized buffers and scales, and I was over 80 KB. That works on paper since the SM has 128 KB, but it means only one thread block per SM, and I had not even started thinking about the MMA accumulators eating into the register file.
+
+I realized Q and K are never needed in FP32 at the same time. Load Q as FP32, quantize it, then reuse the same buffer for K. One staging buffer instead of two. That brought shared memory down to about 50 KB:
+
+| Buffer | Type | Size | Purpose |
+| --- | --- | --- | --- |
+| `staging` | float | 32,768 B | Reusable FP32 buffer for loading from VRAM |
+| `Q_quant` | uint8 | 8,192 B | Q tile after FP4 quantization |
+| `K_quant` | uint8 | 8,192 B | K tile after FP4 quantization |
+| `Q_scales` | uint8 | 256 B | One UE8M0 scale per 32 Q elements |
+| `K_scales` | uint8 | 256 B | One UE8M0 scale per 32 K elements |
+
+Still only one block per SM due to the register pressure from the accumulators, but at least I was not wasting shared memory.
+
+### The loading pattern that almost tripped me up
+
+128 threads need to load 8192 floats from VRAM into shared memory. The standard approach is a strided loop: each thread starts at its own index and jumps by 128 each iteration. Thread 0 loads elements 0, 128, 256, and so on. Thread 1 loads 1, 129, 257. This guarantees that on every iteration, consecutive threads read consecutive addresses, which is the definition of coalesced access.
+
+I initially wrote this with row/column indexing, computing `row = idx / Bd` and `col = idx % Bd` and then calculating the global address from there. It worked, but it was unnecessary complexity. Since Q is row-major and the tile is a contiguous block of rows, the linear index maps directly:
+
+for (int k = 0; k < TILE_SIZE; k += NUM_THREADS) { int idx = tid + k; int g_idx = blockIdx.x * TILE_SIZE + idx; staging[idx] = Q[g_idx]; } __syncthreads();
+
+
+`blockIdx.x * TILE_SIZE` is the offset for this block's group of 64 tokens. No division, no modulo. I kept the row/column version in an early commit before realizing the simplification. Sometimes the clever approach is the dumb one.
+
+### The quantization two-pass problem
+
+I wanted to quantize the floats as I loaded them from VRAM, avoiding the staging buffer entirely. But block scaling killed that idea. To compute the scale factor for a block of 32 elements, you need the maximum absolute value across all 32. During the strided load, a single thread does not see all 32 elements of the same scaling block because they are spread across multiple iterations. Thread 0 sees elements 0, 128, 256, never elements 1 through 31.
+
+So quantization has to be a separate pass after loading. The staging buffer exists specifically because of this dependency. First load everything as FP32, barrier, then quantize in a second pass where each thread handles complete 32-element blocks:
+
+for (int i = tid; i < NUM_SCALE_BLOCKS; i += NUM_THREADS) { uint8_t scale = compute_scale_ue8m0(&staging[i * BLOCK_ELEMENT]); Q_scales[i] = scale; float scale_f = exp2f((float)(scale - 127));
+
+for (int j = 0; j < BLOCK_ELEMENT; j++)
+{
+    float val = staging[i * BLOCK_ELEMENT + j] / scale_f;
+    Q_quant[i * BLOCK_ELEMENT + j] = encode_fp4_e2m1(val);
+}
+} __syncthreads();
+
+
+256 scaling blocks, 128 threads, 2 blocks per thread. Each thread processes its blocks sequentially, scanning for the max, computing the scale, dividing, and encoding all 32 values. It is not fast, there is a lot of branching in `encode_fp4_e2m1` and the inner loop is purely sequential, but it works. Optimization comes later.
+
+K gets the exact same treatment: load into `staging` (overwriting Q's FP32 data, which is already quantized and safe in `Q_quant`), barrier, quantize into `K_quant` and `K_scales`, barrier.
+
+### The MMA fragment loading: the part I could not figure out alone
+
+This is where I spent the most time. The MMA instruction `mma.sync.m16n8k32` expects each of the 32 threads in a warp to hold specific bytes from the A and B matrices in its registers. Not just any bytes, the exact bytes that the hardware expects for that lane. The mapping is defined in the PTX ISA fragment layout tables, and it is not intuitive.
+
+For fragment A (a 16x32 slice of Q), each thread holds two 32-bit registers: `a0` and `a1`. Each register packs 4 FP4 values in their 8-bit containers. The lane ID determines which row the thread reads from (`lane % 16` gives a row from 0 to 15, meaning lanes 0-15 and lanes 16-31 cover the same rows but different column groups). The two registers `a0` and `a1` are not contiguous in memory: they are separated by a stride of 16 columns.
+
+I first tried loading them contiguously, thinking `a0` covers columns 0-3 and `a1` covers columns 4-7. The MMA gave garbage. After going back to the ISA tables, I found that `a0` and `a1` are 16 columns apart, not 4. The columns in between are held by other threads in the warp.
+
+The working version:
+
+int q_row = warp_id * MMA_M + (lane % 16); int q_col = k_tile * MMA_K + (lane / 16) * BYTES_PER_REG;
+
+int q_idx_0 = q_row * Bd + q_col; int q_idx_1 = q_row * Bd + q_col + MMA_A_STRIDE;
+
+uint32_t a0 = Q_quant[q_idx_0] | (Q_quant[q_idx_0 + 1] << 8) | (Q_quant[q_idx_0 + 2] << 16) | (Q_quant[q_idx_0 + 3] << 24);
+
+uint32_t a1 = Q_quant[q_idx_1] | (Q_quant[q_idx_1 + 1] << 8) | (Q_quant[q_idx_1 + 2] << 16) | (Q_quant[q_idx_1 + 3] << 24);
+
+
+`MMA_A_STRIDE = 16` is the gap between the two registers. `BYTES_PER_REG = 4` is how many 8-bit containers fit in one 32-bit register. These are hardware constants that I only discovered through trial and error and reading the ISA diagrams three times.
+
+Fragment B (a 32x8 slice of K) is simpler because each thread only loads one register:
+
+int k_row = k_tile * MMA_K + (lane % 16); int k_col = n_tile * MMA_N + (lane / 16) * BYTES_PER_REG;
+
+int k_idx_0 = k_row * BQ + k_col;
+
+uint32_t b0 = K_quant[k_idx_0] | (K_quant[k_idx_0 + 1] << 8) | (K_quant[k_idx_0 + 2] << 16) | (K_quant[k_idx_0 + 3] << 24);
+
+
+The scale factors slot in naturally. Each thread looks up the scale for the scaling block that contains its loaded values and duplicates it four times across a `uint32_t`:
+
+uint8_t sa = Q_scales[q_row * (Bd / BLOCK_ELEMENT) + k_tile]; uint8_t sb = K_scales[k_row * (BQ / BLOCK_ELEMENT) + (n_tile * MMA_N) / BLOCK_ELEMENT]; uint32_t scale_a = sa | (sa << 8) | (sa << 16) | (sa << 24); uint32_t scale_b = sb | (sb << 8) | (sb << 16) | (sb << 24);
+
+
+### The MMA loop
+
+With fragments loaded, the MMA itself is anticlimactic. It is the same `asm volatile` block from section 4, just wired into a loop. The outer loop covers 8 column fragments of S, the inner loop accumulates 4 k-chunks:
+
+for (int n_tile = 0; n_tile < N_TILES; n_tile++) { float acc[ACC_PER_THREAD] = {0.f};
+
+for (int k_tile = 0; k_tile < K_TILES; k_tile++)
+{
+    // ... load a0, a1, b0, scale_a, scale_b ...
+
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4"
+        ".block_scale.scale_vec::1X.f32.e2m1.e2m1.f32.ue8m0"
+        " {%0, %1, %2, %3},"
+        " {%4, %5},"
+        " {%6},"
+        " {%7, %8, %9, %10},"
+        " %11,"
+        " %12;"
+        : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3])
+        : "r"(a0), "r"(a1),
+          "r"(b0),
+          "f"(acc[0]), "f"(acc[1]), "f"(acc[2]), "f"(acc[3]),
+          "r"(scale_a), "r"(scale_b)
+    );
+}
+}
+
+
+The accumulators are both input and output. On the first k-chunk they are zero. Each subsequent MMA adds its partial product. After 4 iterations, `acc[0]` through `acc[3]` hold the final values for this thread's piece of the (16, 8) output fragment. Four warps, 8 column tiles each, 4 accumulators per thread: the full (64, 64) score matrix lives entirely in registers. No global memory was touched for the intermediate result. That was the whole point.
+
+### What I learned
+
+The hardest part was not the MMA instruction itself but loading the fragments correctly. The ISA defines a rigid mapping between lane IDs and matrix positions. There is no room for creativity here: you either match the expected layout exactly, or you get wrong results with no error message. I wasted a full afternoon loading `a0` and `a1` from contiguous columns before realizing they are 16 apart.
+
+The second lesson is about shared memory reuse. My initial instinct was to allocate everything upfront. The realization that Q and K never overlap in their FP32 form saved 32 KB and kept the design clean. In GPU programming, shared memory is a scarce resource, and the instinct to "just allocate more" does not work.
+
 *Code: [github.com/florianmattana/fp4-fused-attention-sm120](https://github.com/florianmattana/fp4-fused-attention-sm120)*
