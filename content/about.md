@@ -1,5 +1,4 @@
 ---
-title: "About"
 url: "/about/"
 hidemeta: true
 ShowBreadCrumbs: false
