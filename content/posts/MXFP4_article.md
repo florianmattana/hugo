@@ -445,12 +445,11 @@ On small matrices, I was faster. On large matrices, 3x slower. The arithmetic is
 
 ### Why it's slow on large matrices
 
-A GPU executes threads in groups of 32 called **warps**. All 32 threads in a warp run the same instruction at the same time (this is how GPUs get their parallelism: one instruction decoder for 32 execution units). When all 32 threads read from memory simultaneously, the hardware can combine their requests into one wide transaction if the addresses are consecutive. This is called **coalesced access** and it's the single most important performance concept in GPU programming.
+The bottleneck on large matrices is memory access. GPUs execute threads in groups of 32 called **warps**. When all 32 threads in a warp read from consecutive addresses, the memory controller merges everything into a single 128-byte transaction. This is called **coalesced access**.
 
-In my kernel, each thread processes a different data block. Thread 0 reads 32 floats starting at row 0, column 0. Thread 1 reads 32 floats starting at row 0, column 32. These threads are in the same warp, so they execute their first memory load at the same time. But thread 0 reads address A, thread 1 reads address A+128 (32 floats x 4 bytes), thread 2 reads address A+256. These addresses are 128 bytes apart. The memory controller cannot combine them into one transaction. Each read is served separately.
+In my naive kernel, each thread handles a different data block. Thread 0 reads from column 0, thread 1 reads from column 32, thread 2 from column 64. These threads are in the same warp, but their addresses are 128 bytes apart (32 floats x 4 bytes). The memory controller can't merge those into one transaction. Each read is served separately.
 
-On small matrices, the data fits in the GPU's cache, so the scattered reads are served from cache and the penalty is small. On large matrices, every non-coalesced read is a full round trip to global memory (hundreds of cycles), and the performance collapses.
-
+On small matrices, the cache absorbs the penalty. On large matrices, every scattered read hits global memory at full latency (hundreds of cycles), and performance collapses.
 ---
 
 ## 10. The Optimized Kernel: One Warp per Block
@@ -533,7 +532,7 @@ Final result across all test cases: **72.48 μs. First place, ahead of the Trito
 
 **Round-to-nearest-even is everywhere.** I knew this rule from standard floating point arithmetic but didn't expect it in a 4-bit format with only 16 values. The difference between `>=` and `>` at each threshold is invisible in 99.999% of cases, but Tensara's verification caught it.
 
-**Coalesced memory access is the single biggest optimization.** Going from "one thread reads 32 values" to "32 threads each read one value" was the difference between 285 μs and 72 μs on large matrices. The arithmetic was identical. Only the memory access pattern changed.
+**Coalesced memory access is as often the single biggest optimization.** Going from "one thread reads 32 values" to "32 threads each read one value" was the difference between 285 μs and 72 μs on large matrices. The arithmetic was identical. Only the memory access pattern changed.
 
 **Correctness first, always.** The naive kernel was not the fastest, but it was the easiest to debug. Every optimization I applied afterward changed zero lines of algorithm code. The scale, encoder, and packing logic stayed identical. Only the thread-to-data mapping changed.
 
