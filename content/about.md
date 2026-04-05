@@ -1,7 +1,14 @@
 ---
 title: "About"
-layout: "single"
 url: "/about/"
+hidemeta: true
+ShowBreadCrumbs: false
+ShowReadingTime: false
+ShowWordCount: false
+ShowShareButtons: false
+ShowPostNavLinks: false
+showtoc: false
+comments: false
 ---
 
 I'm Florian Mattana, GPU kernel engineer based in France.
