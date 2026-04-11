@@ -1,0 +1,277 @@
+<svg width="100%" viewBox="0 0 680 360" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>Identity matrix test: expected vs actual output</title>
+<desc>Two 8x8 grids showing S_gpu columns 0 through 7. Left grid shows the expected result with 8 ones on the diagonal. Right grid shows the actual buggy result with 20 non-zeros including phantom values in wrong positions.</desc>
+
+<style>
+  text { font-family: monospace; fill: #444; }
+  .label { font-size: 11px; fill: #888; }
+  .title { font-size: 13px; font-weight: 600; fill: #222; }
+  .sub   { font-size: 11px; fill: #888; }
+  .leg   { font-size: 10px; fill: #666; }
+  .val   { font-size: 10px; font-weight: 600; fill: #fff; }
+</style>
+
+<!-- subtitle -->
+<text class="label" x="340" y="20" text-anchor="middle">Q = K = I_64   →   expected S = I_64   (columns 0–7 shown)</text>
+
+<!-- LEFT title -->
+<text class="title" x="168" y="48" text-anchor="middle">expected</text>
+<text class="sub"   x="168" y="64" text-anchor="middle">8 non-zeros</text>
+
+<!-- RIGHT title -->
+<text class="title" x="512" y="48" text-anchor="middle">actual (buggy)</text>
+<text class="sub"   x="512" y="64" text-anchor="middle">20 non-zeros</text>
+
+<!-- row labels -->
+<text class="label" x="60" y="101" text-anchor="end">row 0</text>
+<text class="label" x="60" y="131" text-anchor="end">row 1</text>
+<text class="label" x="60" y="161" text-anchor="end">row 2</text>
+<text class="label" x="60" y="191" text-anchor="end">row 3</text>
+<text class="label" x="60" y="221" text-anchor="end">row 4</text>
+<text class="label" x="60" y="251" text-anchor="end">row 5</text>
+<text class="label" x="60" y="281" text-anchor="end">row 6</text>
+<text class="label" x="60" y="311" text-anchor="end">row 7</text>
+
+<!-- col labels LEFT -->
+<text class="label" x="99"  y="332" text-anchor="middle">c0</text>
+<text class="label" x="129" y="332" text-anchor="middle">c1</text>
+<text class="label" x="159" y="332" text-anchor="middle">c2</text>
+<text class="label" x="189" y="332" text-anchor="middle">c3</text>
+<text class="label" x="219" y="332" text-anchor="middle">c4</text>
+<text class="label" x="249" y="332" text-anchor="middle">c5</text>
+<text class="label" x="279" y="332" text-anchor="middle">c6</text>
+<text class="label" x="309" y="332" text-anchor="middle">c7</text>
+
+<!-- LEFT GRID empty cells -->
+<g fill="none" stroke="#ccc" stroke-width="0.5">
+  <rect x="84"  y="81" width="30" height="30" rx="2"/>
+  <rect x="114" y="81" width="30" height="30" rx="2"/>
+  <rect x="144" y="81" width="30" height="30" rx="2"/>
+  <rect x="174" y="81" width="30" height="30" rx="2"/>
+  <rect x="204" y="81" width="30" height="30" rx="2"/>
+  <rect x="234" y="81" width="30" height="30" rx="2"/>
+  <rect x="264" y="81" width="30" height="30" rx="2"/>
+  <rect x="294" y="81" width="30" height="30" rx="2"/>
+
+  <rect x="84"  y="111" width="30" height="30" rx="2"/>
+  <rect x="114" y="111" width="30" height="30" rx="2"/>
+  <rect x="144" y="111" width="30" height="30" rx="2"/>
+  <rect x="174" y="111" width="30" height="30" rx="2"/>
+  <rect x="204" y="111" width="30" height="30" rx="2"/>
+  <rect x="234" y="111" width="30" height="30" rx="2"/>
+  <rect x="264" y="111" width="30" height="30" rx="2"/>
+  <rect x="294" y="111" width="30" height="30" rx="2"/>
+
+  <rect x="84"  y="141" width="30" height="30" rx="2"/>
+  <rect x="114" y="141" width="30" height="30" rx="2"/>
+  <rect x="144" y="141" width="30" height="30" rx="2"/>
+  <rect x="174" y="141" width="30" height="30" rx="2"/>
+  <rect x="204" y="141" width="30" height="30" rx="2"/>
+  <rect x="234" y="141" width="30" height="30" rx="2"/>
+  <rect x="264" y="141" width="30" height="30" rx="2"/>
+  <rect x="294" y="141" width="30" height="30" rx="2"/>
+
+  <rect x="84"  y="171" width="30" height="30" rx="2"/>
+  <rect x="114" y="171" width="30" height="30" rx="2"/>
+  <rect x="144" y="171" width="30" height="30" rx="2"/>
+  <rect x="174" y="171" width="30" height="30" rx="2"/>
+  <rect x="204" y="171" width="30" height="30" rx="2"/>
+  <rect x="234" y="171" width="30" height="30" rx="2"/>
+  <rect x="264" y="171" width="30" height="30" rx="2"/>
+  <rect x="294" y="171" width="30" height="30" rx="2"/>
+
+  <rect x="84"  y="201" width="30" height="30" rx="2"/>
+  <rect x="114" y="201" width="30" height="30" rx="2"/>
+  <rect x="144" y="201" width="30" height="30" rx="2"/>
+  <rect x="174" y="201" width="30" height="30" rx="2"/>
+  <rect x="204" y="201" width="30" height="30" rx="2"/>
+  <rect x="234" y="201" width="30" height="30" rx="2"/>
+  <rect x="264" y="201" width="30" height="30" rx="2"/>
+  <rect x="294" y="201" width="30" height="30" rx="2"/>
+
+  <rect x="84"  y="231" width="30" height="30" rx="2"/>
+  <rect x="114" y="231" width="30" height="30" rx="2"/>
+  <rect x="144" y="231" width="30" height="30" rx="2"/>
+  <rect x="174" y="231" width="30" height="30" rx="2"/>
+  <rect x="204" y="231" width="30" height="30" rx="2"/>
+  <rect x="234" y="231" width="30" height="30" rx="2"/>
+  <rect x="264" y="231" width="30" height="30" rx="2"/>
+  <rect x="294" y="231" width="30" height="30" rx="2"/>
+
+  <rect x="84"  y="261" width="30" height="30" rx="2"/>
+  <rect x="114" y="261" width="30" height="30" rx="2"/>
+  <rect x="144" y="261" width="30" height="30" rx="2"/>
+  <rect x="174" y="261" width="30" height="30" rx="2"/>
+  <rect x="204" y="261" width="30" height="30" rx="2"/>
+  <rect x="234" y="261" width="30" height="30" rx="2"/>
+  <rect x="264" y="261" width="30" height="30" rx="2"/>
+  <rect x="294" y="261" width="30" height="30" rx="2"/>
+
+  <rect x="84"  y="291" width="30" height="30" rx="2"/>
+  <rect x="114" y="291" width="30" height="30" rx="2"/>
+  <rect x="144" y="291" width="30" height="30" rx="2"/>
+  <rect x="174" y="291" width="30" height="30" rx="2"/>
+  <rect x="204" y="291" width="30" height="30" rx="2"/>
+  <rect x="234" y="291" width="30" height="30" rx="2"/>
+  <rect x="264" y="291" width="30" height="30" rx="2"/>
+  <rect x="294" y="291" width="30" height="30" rx="2"/>
+</g>
+
+<!-- LEFT diagonal (correct) -->
+<g fill="#1D9E75">
+  <rect x="84"  y="81"  width="30" height="30" rx="2"/>
+  <rect x="114" y="111" width="30" height="30" rx="2"/>
+  <rect x="144" y="141" width="30" height="30" rx="2"/>
+  <rect x="174" y="171" width="30" height="30" rx="2"/>
+  <rect x="204" y="201" width="30" height="30" rx="2"/>
+  <rect x="234" y="231" width="30" height="30" rx="2"/>
+  <rect x="264" y="261" width="30" height="30" rx="2"/>
+  <rect x="294" y="291" width="30" height="30" rx="2"/>
+</g>
+<g class="val">
+  <text x="99"  y="97"  text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="129" y="127" text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="159" y="157" text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="189" y="187" text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="219" y="217" text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="249" y="247" text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="279" y="277" text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="309" y="307" text-anchor="middle" dominant-baseline="central">1</text>
+</g>
+
+<!-- DIVIDER -->
+<line x1="348" y1="70" x2="348" y2="325" stroke="#ccc" stroke-width="0.5" stroke-dasharray="4 4"/>
+
+<!-- RIGHT GRID empty cells -->
+<g fill="none" stroke="#ccc" stroke-width="0.5">
+  <rect x="428" y="81" width="30" height="30" rx="2"/>
+  <rect x="458" y="81" width="30" height="30" rx="2"/>
+  <rect x="488" y="81" width="30" height="30" rx="2"/>
+  <rect x="518" y="81" width="30" height="30" rx="2"/>
+  <rect x="548" y="81" width="30" height="30" rx="2"/>
+  <rect x="578" y="81" width="30" height="30" rx="2"/>
+  <rect x="608" y="81" width="30" height="30" rx="2"/>
+  <rect x="638" y="81" width="30" height="30" rx="2"/>
+
+  <rect x="428" y="111" width="30" height="30" rx="2"/>
+  <rect x="458" y="111" width="30" height="30" rx="2"/>
+  <rect x="488" y="111" width="30" height="30" rx="2"/>
+  <rect x="518" y="111" width="30" height="30" rx="2"/>
+  <rect x="548" y="111" width="30" height="30" rx="2"/>
+  <rect x="578" y="111" width="30" height="30" rx="2"/>
+  <rect x="608" y="111" width="30" height="30" rx="2"/>
+  <rect x="638" y="111" width="30" height="30" rx="2"/>
+
+  <rect x="428" y="141" width="30" height="30" rx="2"/>
+  <rect x="458" y="141" width="30" height="30" rx="2"/>
+  <rect x="488" y="141" width="30" height="30" rx="2"/>
+  <rect x="518" y="141" width="30" height="30" rx="2"/>
+  <rect x="548" y="141" width="30" height="30" rx="2"/>
+  <rect x="578" y="141" width="30" height="30" rx="2"/>
+  <rect x="608" y="141" width="30" height="30" rx="2"/>
+  <rect x="638" y="141" width="30" height="30" rx="2"/>
+
+  <rect x="428" y="171" width="30" height="30" rx="2"/>
+  <rect x="458" y="171" width="30" height="30" rx="2"/>
+  <rect x="488" y="171" width="30" height="30" rx="2"/>
+  <rect x="518" y="171" width="30" height="30" rx="2"/>
+  <rect x="548" y="171" width="30" height="30" rx="2"/>
+  <rect x="578" y="171" width="30" height="30" rx="2"/>
+  <rect x="608" y="171" width="30" height="30" rx="2"/>
+  <rect x="638" y="171" width="30" height="30" rx="2"/>
+
+  <rect x="428" y="201" width="30" height="30" rx="2"/>
+  <rect x="458" y="201" width="30" height="30" rx="2"/>
+  <rect x="488" y="201" width="30" height="30" rx="2"/>
+  <rect x="518" y="201" width="30" height="30" rx="2"/>
+  <rect x="548" y="201" width="30" height="30" rx="2"/>
+  <rect x="578" y="201" width="30" height="30" rx="2"/>
+  <rect x="608" y="201" width="30" height="30" rx="2"/>
+  <rect x="638" y="201" width="30" height="30" rx="2"/>
+
+  <rect x="428" y="231" width="30" height="30" rx="2"/>
+  <rect x="458" y="231" width="30" height="30" rx="2"/>
+  <rect x="488" y="231" width="30" height="30" rx="2"/>
+  <rect x="518" y="231" width="30" height="30" rx="2"/>
+  <rect x="548" y="231" width="30" height="30" rx="2"/>
+  <rect x="578" y="231" width="30" height="30" rx="2"/>
+  <rect x="608" y="231" width="30" height="30" rx="2"/>
+  <rect x="638" y="231" width="30" height="30" rx="2"/>
+
+  <rect x="428" y="261" width="30" height="30" rx="2"/>
+  <rect x="458" y="261" width="30" height="30" rx="2"/>
+  <rect x="488" y="261" width="30" height="30" rx="2"/>
+  <rect x="518" y="261" width="30" height="30" rx="2"/>
+  <rect x="548" y="261" width="30" height="30" rx="2"/>
+  <rect x="578" y="261" width="30" height="30" rx="2"/>
+  <rect x="608" y="261" width="30" height="30" rx="2"/>
+  <rect x="638" y="261" width="30" height="30" rx="2"/>
+
+  <rect x="428" y="291" width="30" height="30" rx="2"/>
+  <rect x="458" y="291" width="30" height="30" rx="2"/>
+  <rect x="488" y="291" width="30" height="30" rx="2"/>
+  <rect x="518" y="291" width="30" height="30" rx="2"/>
+  <rect x="548" y="291" width="30" height="30" rx="2"/>
+  <rect x="578" y="291" width="30" height="30" rx="2"/>
+  <rect x="608" y="291" width="30" height="30" rx="2"/>
+  <rect x="638" y="291" width="30" height="30" rx="2"/>
+</g>
+
+<!-- RIGHT diagonal (correct) -->
+<g fill="#1D9E75">
+  <rect x="428" y="81"  width="30" height="30" rx="2"/>
+  <rect x="458" y="111" width="30" height="30" rx="2"/>
+  <rect x="488" y="141" width="30" height="30" rx="2"/>
+  <rect x="518" y="171" width="30" height="30" rx="2"/>
+  <rect x="548" y="201" width="30" height="30" rx="2"/>
+  <rect x="578" y="231" width="30" height="30" rx="2"/>
+  <rect x="608" y="261" width="30" height="30" rx="2"/>
+  <rect x="638" y="291" width="30" height="30" rx="2"/>
+</g>
+<g class="val">
+  <text x="443" y="97"  text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="473" y="127" text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="503" y="157" text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="533" y="187" text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="563" y="217" text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="593" y="247" text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="623" y="277" text-anchor="middle" dominant-baseline="central">1</text>
+  <text x="653" y="307" text-anchor="middle" dominant-baseline="central">1</text>
+</g>
+
+<!-- RIGHT phantom values (should be 0, but kernel produced non-zero) -->
+<g fill="#D85A30" opacity="0.8">
+  <rect x="548" y="81"  width="30" height="30" rx="2"/>
+  <rect x="578" y="111" width="30" height="30" rx="2"/>
+  <rect x="608" y="141" width="30" height="30" rx="2"/>
+  <rect x="638" y="171" width="30" height="30" rx="2"/>
+  <rect x="428" y="201" width="30" height="30" rx="2"/>
+  <rect x="458" y="231" width="30" height="30" rx="2"/>
+  <rect x="488" y="261" width="30" height="30" rx="2"/>
+  <rect x="518" y="291" width="30" height="30" rx="2"/>
+  <rect x="488" y="81"  width="30" height="30" rx="2"/>
+  <rect x="608" y="201" width="30" height="30" rx="2"/>
+  <rect x="458" y="261" width="30" height="30" rx="2"/>
+  <rect x="488" y="291" width="30" height="30" rx="2"/>
+</g>
+<g style="font-size:9px;font-weight:600;fill:#fff;font-family:monospace">
+  <text x="563" y="97"  text-anchor="middle" dominant-baseline="central">≠0</text>
+  <text x="593" y="127" text-anchor="middle" dominant-baseline="central">≠0</text>
+  <text x="623" y="157" text-anchor="middle" dominant-baseline="central">≠0</text>
+  <text x="653" y="187" text-anchor="middle" dominant-baseline="central">≠0</text>
+  <text x="443" y="217" text-anchor="middle" dominant-baseline="central">≠0</text>
+  <text x="473" y="247" text-anchor="middle" dominant-baseline="central">≠0</text>
+  <text x="503" y="277" text-anchor="middle" dominant-baseline="central">≠0</text>
+  <text x="533" y="307" text-anchor="middle" dominant-baseline="central">≠0</text>
+  <text x="503" y="97"  text-anchor="middle" dominant-baseline="central">≠0</text>
+  <text x="623" y="217" text-anchor="middle" dominant-baseline="central">≠0</text>
+  <text x="473" y="277" text-anchor="middle" dominant-baseline="central">≠0</text>
+  <text x="503" y="307" text-anchor="middle" dominant-baseline="central">≠0</text>
+</g>
+
+<!-- LEGEND -->
+<rect x="84"  y="340" width="12" height="12" rx="2" fill="#1D9E75"/>
+<text class="leg" x="100" y="350">correct  (S[i][i] = 1)</text>
+<rect x="230" y="340" width="12" height="12" rx="2" fill="#D85A30"/>
+<text class="leg" x="246" y="350">unexpected non-zero  (should be 0 — lane loaded wrong bytes)</text>
+</svg>
