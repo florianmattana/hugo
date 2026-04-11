@@ -399,17 +399,23 @@ For the first time, I could see where the problem was.
 
 ### The wrong register count
 
-The A matrix is a [16 x 32] slice of Q. With 32 threads in a warp, each holding 4 FP4-packed registers of 4 elements each, that is exactly 32 times 4 times 4 = 512 elements, matching the tile size of 16 times 32. There is exactly one correct layout.
+We are inside the k_tile loop, at the moment where each thread loads its slice of Qinto registers before calling the MMA. This is the fragment load: the step thatdistributes the A matrix across the 32 threads of the warp so the Tensor Core can consume it. The A tile here is a [16 x 32] slice of Q: 16 token rows, each spanning 32 elementsalong the head dimension. 512 values in total, divided exactly across 32 threads.Each thread holds 4 registers of 4 FP4 elements each: 32 × 4 × 4 = 512. The distribution is exact. There is no slack.
 
-My original code loaded two registers per thread for A. That was wrong. The correct number is four. With only two registers, half the A matrix was never loaded. The hardware was reading uninitialized memory for those positions and silently producing garbage accumulations.
+My original code loaded two registers per thread. That covered only half the A tile. The other 256 elements had no owner. The hardware read those positions from whatever happened to be in the registers at that point, uninitialized memory, and computed dot products against it. No error was raised. The kernel ran to completion and wroteoutput that looked like real attention scores.
 
 ### The wrong lane grouping
 
-The grouping was also wrong. I had used `lane / 16` to select K-column groups, which produces two groups of 16 lanes each. That means lanes 0 through 15 all loaded identical K-column positions, and lanes 16 through 31 loaded another identical set. Sixteen lanes loading the same bytes is never correct.
+The register count was not the only problem. Even with the right number of registers, the data inside them was wrong.
+The K-column each thread loads depends on its lane ID. My formula used `lane / 16`, which divides the 32 lanes into two groups of 16. Every thread in the first grouploaded the same K-column positions, and every thread in the second group loaded another identical set. Two groups of 16 threads duplicating each other's work means only two distinct K-column ranges were ever read. The other half of the A tile, the K-columns that no group was assigned to, was never touched.
+
+The correct formula is `lane % 4`, which creates four groups of eight threads. Each group gets a different K-column subgroup, and together the four groups cover all 32 K-columns of the A tile without overlap or gap.
 
 ### The fix
 
-The right grouping uses `lane / 4` to determine the row within the warp tile and `lane % 4` to determine the K-column subgroup. That gives 8 row positions times 4 column groups = 32 unique thread assignments. The four registers follow a specific pattern: the first two registers cover row0 and row0+8 at the base K-column, and the second two cover the same rows with K-columns shifted by 16. The row alternates between row0 and row0+8 rather than staying on one row for all four registers.
+With `lane / 4` for the row and `lane % 4` for the K-column subgroup, each of the32 threads gets a unique assignment: 8 row positions times 4 K-column groups. No two threads duplicate each other's work and no position in the A tile goes unloaded.
+The four registers follow a pattern that is worth making explicit because it is easy to get wrong. The first two registers, a0 and a1, cover the same K-column range but different rows: a0 for row0, a1 for row0+8. The second two registers, a2 and a3, shift the K-columns by 16 and repeat the same row pattern: a2 for row0, a3 for row0+8. The row alternates across registers rather than incrementing, which is the opposite of what feels natural.
+
+Running the identity matrix test after this fix: 8 non-zeros, on the diagonal at the correct positions for columns 0 through 7.
 
 After this fix: 8 non-zeros, correct diagonal positions for columns 0 through 7.
 
