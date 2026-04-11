@@ -337,10 +337,114 @@ for (int k_tile = 0; k_tile < K_TILES; k_tile++)
 
 The accumulators are both input and output. On the first k-chunk they are zero. Each subsequent MMA adds its partial product. After 4 iterations, `acc[0]` through `acc[3]` hold the final values for this thread's piece of the (16, 8) output fragment. Four warps, 8 column tiles each, 4 accumulators per thread: the full (64, 64) score matrix lives entirely in registers. No global memory was touched for the intermediate result. That was the whole point.
 
-### What I learned
+## 8. The First Correctness Test
 
-The hardest part was not the MMA instruction itself but loading the fragments correctly. The ISA defines a rigid mapping between lane IDs and matrix positions. There is no room for creativity here: you either match the expected layout exactly, or you get wrong results with no error message. I wasted a full afternoon loading `a0` and `a1` from contiguous columns before realizing they are 16 apart.
+Section 7 ended with the MMA loop assembled and the score matrix living in registers. On paper, the first part of the kernel was complete. I ran the correctness test against a float32 CPU reference.
 
-The second lesson is about shared memory reuse. My initial instinct was to allocate everything upfront. The realization that Q and K never overlap in their FP32 form saved 32 KB and kept the design clean. In GPU programming, shared memory is a scarce resource, and the instinct to "just allocate more" does not work.
+Cosine similarity: 0.06.
+*Cosine similarity measures the angle between two output vectors. A value of 1.0 means the GPU and CPU outputs are identical. A value of 0 means they are completely uncorrelated. At 0.06, the GPU was producing noise.*
+That number means the GPU output is essentially random relative to the correct answer. Not slightly off. Not within a few percent. Completely uncorrelated. Something fundamental was wrong, but I had no information about what.
 
-*Code: [github.com/florianmattana/fp4-fused-attention-sm120](https://github.com/florianmattana/fp4-fused-attention-sm120)*
+I checked the three validated components first. The encoding function worked. The block scaling worked. The isolated MMA test from section 4 still printed 256.0 correctly. The problem had to be in how the full kernel assembled those pieces together.
+
+The most obvious candidate was the fragment loading. In section 7, I described loading `a0` and `a1` for the A fragment and `b0` for B. That description was my best understanding at the time. It was wrong in two ways I had not yet discovered.
+
+## 9. The Fragment Layout Problem
+
+To understand what went wrong, it helps to understand what a fragment actually is. When the GPU executes an MMA instruction, the 32 threads in a warp collectively own a tile of the A matrix, a tile of B, and the accumulator tile D. Each individual thread holds a specific slice of that tile in its registers. That slice is the thread's fragment. The hardware defines precisely which matrix positions belong to which thread, a mapping called the fragment layout.
+
+For FP16 and BF16 MMA variants, NVIDIA documents these layouts with diagrams in the PTX ISA specification. For `mxf8f6f4 m16n8k32` on SM120, those diagrams do not exist. The instruction is listed, the operand counts are given, but the per-lane mapping is absent.
+
+I posted a question on the NVIDIA developer forums on March 19. No response.
+[NVIDIA developer forums](https://forums.developer.nvidia.com/t/fragment-layout-for-mma-sync-aligned-m16n8k64-with-fp4-e2m1-and-block-scaling-on-sm120/364020)
+
+So I started guessing. The PTX ISA gives you the operand count for the instruction: 4 registers for A, 2 for B, 4 for the accumulator. But it does not tell you which matrix row or column each register corresponds to for a given lane. That mapping is what I was guessing.
+A lane is a thread within a warp, numbered 0 to 31. For a 16x32 tile of Q spread across 32 threads, each lane owns a specific slice. The question is: which slice? Does lane 5 own row 5, or row 1, or row 5 modulo 4? Does it own K-columns 0 through 3, or 20 through 23? There are many plausible formulas and only one correct answer.
+I tried `lane % 16` for the row index and `lane / 16` for the K-column group. I tried different strides between registers: 4, 8, 16 columns apart. Each attempt compiled without errors and produced a different cosine between 0.01 and 0.09. A cosine of 0.01 and a cosine of 0.09 both mean "wrong". There was no gradient to follow. I could not tell if I was getting closer to the correct layout or further away, because the only signal I had was a single float that told me nothing about where the error was.
+
+The problem was not the guesses. The problem was the test.
+
+## 10. Finding the Right Diagnostic
+
+Comparing a quantized GPU kernel against a float32 CPU reference tells you whether the final answer is right or wrong. It tells you nothing about where it went wrong. With a broken fragment layout and FP4 quantization both contributing noise, the cosine was useless as a diagnostic.
+
+I replaced the attention test with a simpler one designed to give precise information. I set Q and K to the 64x64 identity matrix, zero-padded to the [64, 128] shape the kernel expects. The expected output is S = Q times K-transpose = I_64. Every diagonal entry is 1.0, every off-diagonal entry is 0.
+
+This test has two properties the attention test does not. First, 1.0 is exactly representable in FP4 E2M1, so quantization cannot explain wrong results. Second, each non-zero in S comes from exactly one dot product. If S[2][5] is non-zero when it should be zero, it means the threads responsible for row 2 of Q and column 5 of K loaded data they were not supposed to load. The wrong value points directly to the wrong lane.
+
+I also isolated the fragment loading from everything else by writing a separate debug kernel that loads directly from global memory, skips shared memory entirely, and hardcodes all scales to 1.0. One variable at a time.
+
+Running this with my best guess at the fragment layout: 20 non-zeros instead of 8. Columns 0 through 7 of the identity matrix should produce exactly 8 ones on the diagonal. There were 12 phantom values in wrong positions. For the first time in weeks, I could see where the problem was.
+
+## 11. Fixing the A Fragment
+
+The A matrix is a [16 x 32] slice of Q. With 32 threads in a warp, each holding 4 FP4-packed registers of 4 elements each, that is exactly 32 times 4 times 4 = 512 elements, matching the tile size of 16 times 32. The math is tight. There is exactly one correct layout.
+
+My original code loaded two registers per thread for A. That was wrong. The correct number is four. With only two registers, half the A matrix was never loaded. The hardware was reading uninitialized memory for those positions and silently producing garbage accumulations.
+
+The grouping was also wrong. I had used `lane / 16` to select K-column groups, which produces two groups of 16 lanes each. That means lanes 0 through 15 all loaded identical K-column positions, and lanes 16 through 31 loaded another identical set. Sixteen lanes loading the same bytes is never correct.
+
+The right grouping uses `lane / 4` to determine the row within the warp tile and `lane % 4` to determine the K-column subgroup. That gives 8 row positions times 4 column groups = 32 unique thread assignments. The four registers follow a specific pattern: the first two registers cover row0 and row0+8 at the base K-column, and the second two cover the same rows but with K-columns shifted by 16. The row alternates between row0 and row0+8 rather than staying on one row for all four registers.
+
+After this fix: 8 non-zeros, correct diagonal positions for columns 0 through 7.
+
+## 12. Fixing the B Fragment
+
+Adding the loop over all 8 column tiles to cover the full 64x64 matrix revealed the same class of error in the K loading. The original code used `lane % 16` for the head-dimension index and `lane / 16` for the token index. Same result: only two distinct token groups, half the lanes loading duplicate data.
+
+The fix mirrors the A correction. `lane / 4` selects the token within the column tile, `lane % 4` selects the head-dimension subgroup. The two B registers cover the same token at K-column positions that are 16 apart.
+
+After this fix: 64 non-zeros, S equals I_64 exactly.
+
+I confirmed with a second test using Q and K filled from the set {-2, -1, 0, 1, 2}. These values are all exactly representable in FP4 E2M1. Cosine similarity: 1.000000. Max absolute error: 0.000. The fragment loading was correct.
+
+The identity matrix test took less than an afternoon to implement and confirmed both fixes in one run. The previous weeks of guessing produced nothing because I was testing the wrong thing.
+
+## 13. The Remaining Bugs
+
+With the fragment layout correct, I moved the validated loading code into the full kernel that uses shared memory and quantization. The cosine dropped back to around 0.06. A different set of problems.
+
+**The K stride was wrong.** K is stored row-major in shared memory as `K_quant[token * Bd + head_dim]`, where Bd is 128. My original indexing used `k_row * BQ + k_col`, treating BQ (64) as the row stride instead of Bd (128). Every K access was reading from roughly half the correct memory address. The fix was straightforward: replace BQ with Bd in the stride.
+
+**The K scale index was also wrong.** The scale array for K is indexed by token first. The stride between tokens is `Bd / BLOCK_ELEMENT`, which is 4 (the number of 32-element scaling blocks along the 128-element head dimension). My code was using `BQ / BLOCK_ELEMENT` instead, which is 2. The scale lookups were hitting the wrong positions in K_scales.
+
+**A variable was declared in the wrong scope.** `q_row0`, which stores the row index a thread is responsible for, was declared inside the k_tile loop. The final output write, which happens after both loops, needed `q_row0` but it was out of scope. The compiler silently reused whatever value was on the stack. Moving the declaration before both loops fixed it.
+
+**A variable was declared twice.** `out_col`, the output column index, appeared once inside the n_tile loop and once in the output write after the loop. The second declaration shadowed the first. Since `out_col` does not depend on n_tile, moving it to a single declaration before both loops fixed the shadowing.
+
+**Two lanes were writing to the same row.** The output write computed `q_row0 = warp_id * MMA_M + (lane % 16)`. With `lane % 16`, lane 0 and lane 16 both produce `q_row0 = 0`. They write to identical memory positions and one overwrites the other. Lanes 4 and 20 collide on row 1, lanes 8 and 24 on row 2, and so on. The correct formula is `lane / 4`, which assigns each unique row to exactly one group of four lanes with no collisions.
+
+After these five fixes, the output values were non-zero and plausible in sign and magnitude. The cosine reached around 0.19. Still broken, but the shape of the error had changed.
+
+## 14. The Scale Layout
+
+One register per thread for `scale_a`, one for `scale_b`. But A has 16 rows and each needs its own scale. B has 8 columns and each needs its own scale. A single `uint32_t` per thread cannot hold all of that. The hardware must be reading specific bytes from specific lanes, but again, the PTX ISA does not document which ones for this instruction variant.
+
+Same approach as the fragment layout: probe empirically.
+
+I filled Q and K with all 1.0 (every byte packed as `0x08`) and set all scales to 127, which corresponds to 2 to the power of 0, meaning scale equals 1.0. The baseline output is 32.0 everywhere: 32 multiply-accumulates of 1.0 times 1.0.
+
+Then I ran the kernel 32 times. Each run set exactly one lane's `scale_a` to 128, which corresponds to 2 to the power of 1, meaning scale equals 2.0, while all other lanes kept 127. If the hardware reads lane L's scale for row R, then row R of the output doubles from 32.0 to 64.0. I recorded which rows changed for each target lane.
+
+The pattern that emerged:
+
+| Lane condition | Row affected |
+| --- | --- |
+| lane % 4 == 0 | lane / 4, covering rows 0 through 7 |
+| lane % 4 == 1 | lane / 4 + 8, covering rows 8 through 15 |
+| lane % 4 == 2 | no effect |
+| lane % 4 == 3 | no effect |
+
+The same probing on `scale_b` showed that only lanes where `lane % 4 == 0` have any effect, and lane L controls column `lane / 4`.
+
+This is consistent with the A fragment structure. The register `a0` covers row0 and its scale is read from the lane with `lane % 4 == 0`. The register `a1` covers row0+8 and its scale comes from `lane % 4 == 1`. Lanes 2 and 3 contribute data through their A registers but the hardware ignores whatever scale value they hold.
+
+This also resolved a secondary issue. The original kernel packed the scale byte four times into the `uint32_t`: `sa | (sa << 8) | (sa << 16) | (sa << 24)`. This worked accidentally because the hardware reads byte 0 of the register, and packing the same byte four times keeps byte 0 correct. But casting directly to `uint32_t` is cleaner and the intent is explicit.
+
+## 15. Online Softmax and the Accumulation of V
+
+With correct fragment loading, correct scale indexing, and correct output addressing, the kernel was computing S = Q times K-transpose correctly in registers. The second half of the fused attention is `Out = softmax(S) times V`.
+
+Writing S to global memory, running softmax separately, reading it back, and multiplying by V would defeat the entire purpose of the fused kernel. Instead, I used the online softmax algorithm introduced in the Flash Attention paper. The idea is to maintain a running state that updates as each column tile of S is computed, so the softmax normalization is applied incrementally without ever materializing the full score matrix.
+
+The running state for each row has three components: `m`, the maximum score seen so far; `l`, the sum of exponentials seen so far; and `O`, the unnormalized output accumulated so far. When a new tile arrives, the update is:
