@@ -380,12 +380,13 @@ The problem was not the guesses. The problem was the test.
 ### The identity matrix test
 
 I replaced the attention test with a simpler one designed to give precise information. I set Q and K to the 64x64 identity matrix, zero-padded to the [64, 128] shape the kernel expects. The expected output is S = Q times K-transpose = I_64. Every diagonal entry is 1.0, every off-diagonal entry is 0.
+*When you multiply a matrix by its own transpose, the result at position [i][j] is the dot product of row i with row j. For the identity matrix, row i contains a single 1.0 at position i and zeros everywhere else. The dot product of row i with row j is 1.0 only when i equals j, and 0 in every other case. That is why the result is the identity matrix again.*
 
 I also isolated the fragment loading from everything else by writing a separate debug kernel that loads directly from global memory, skips shared memory entirely, and hardcodes all scales to 1.0. One variable at a time.
 
 Running this with my best guess at the fragment layout: 20 non-zeros instead of 8. Columns 0 through 7 of the identity matrix should produce exactly 8 ones on the diagonal. There were 12 phantom values in wrong positions.
 
-![Identity matrix test](identity_matrix_test.svg)
+<img src="/identity_matrix_test.svg" alt="Identity matrix test" style="width:100%;max-width:680px;">
 
 ### What it reveals
 
@@ -429,35 +430,59 @@ The identity matrix test took less than an afternoon to implement and confirmed 
 
 ## 13. The Remaining Bugs
 
-With the fragment layout correct, I moved the validated loading code into the full kernel that uses shared memory and quantization. The cosine dropped back to around 0.06. A different set of problems.
+With the fragment layout validated on clean data, I moved the corrected loading code into the full kernel that uses shared memory and quantization. The cosine dropped back to 0.06. A different set of problems, same symptom.
 
-### The K stride and scale index
+### The K stride
 
-K is stored row-major in shared memory as `K_quant[token * Bd + head_dim]`, where Bd is 128. My original indexing used `k_row * BQ + k_col`, treating BQ (64) as the row stride instead of Bd (128). Every K access was reading from roughly half the correct memory address.
+K is stored row-major in shared memory as `K_quant[token * Bd + head_dim]`, where `Bd` is 128. My indexing used `token * BQ + head_dim`, treating `BQ` (64) as the row stride instead of `Bd` (128). Every K access was reading from roughly half the correct address. The kernel was computing dot products between Q rows and completely wrong K bytes.
 
-The scale array for K is indexed by token first. The stride between tokens is `Bd / BLOCK_ELEMENT`, which is 4. My code was using `BQ / BLOCK_ELEMENT` instead, which is 2. The scale lookups were hitting the wrong positions in K_scales.
+Fix: replace `BQ` with `Bd` in the K stride.
 
-### The scope and declaration errors
+Cosine after fix: still 0.06. The next bug was masking any improvement.
 
-`q_row0`, which stores the row index a thread is responsible for, was declared inside the k_tile loop. The final output write, which happens after both loops, needed `q_row0` but it was out of scope. The compiler silently reused whatever value was on the stack.
+### The K scale index
 
-`out_col`, the output column index, appeared once inside the n_tile loop and once in the output write after the loop. The second declaration shadowed the first. Both variables needed to be declared once before both loops.
+The scale array for K is indexed by token first, then by k_tile. The stride between tokens is `Bd / BLOCK_ELEMENT`, which is 4. My code was using `BQ / BLOCK_ELEMENT` instead, which is 2. Every scale lookup was hitting the wrong position in `K_scales`, applying the wrong normalization factor to every K block.
+
+Fix: replace `BQ` with `Bd` in the scale stride.
+
+Cosine after fix: still 0.06. Two more bugs waiting.
+
+### The scope errors
+
+`q_row0` was declared inside the k_tile loop. The output write, which happens after both loops, needed `q_row0` but it was out of scope. The compiler silently reused whatever value was on the stack at that point, producing output at arbitrary row positions.
+
+`out_col` was declared twice: once inside the n_tile loop and once in the output write. The second declaration shadowed the first. Since both used the same formula, the values happened to be the same, but the shadowing masked a real structural problem.
+
+Both variables needed to be declared once before both loops.
+
+Cosine after fix: still 0.06. One more.
 
 ### The lane collision
 
-The output write computed `q_row0 = warp_id * MMA_M + (lane % 16)`. With `lane % 16`, lane 0 and lane 16 both produce `q_row0 = 0`. They write to identical memory positions and one overwrites the other. Lanes 4 and 20 collide on row 1, lanes 8 and 24 on row 2, and so on.
+The output write computed `q_row0 = warp_id * MMA_M + (lane % 16)`. With `lane % 16`, lane 0 and lane 16 both produce `q_row0 = 0`. They write to identical positions in the output array and one overwrites the other. Lanes 4 and 20 collide on row 1, lanes 8 and 24 on row 2, and so on. Half the output was being written twice and the other half was never written at all.
 
-The correct formula is `lane / 4`, which assigns each unique row to exactly one group of four lanes with no collisions. After this fix, all output values were non-zero.
+The correct formula is `lane / 4`, which assigns each unique row to exactly one group of four lanes with no collisions.
+
+Cosine after fix: 0.19. The output was wrong but no longer completely random. The V accumulation was now the dominant error.
 
 ### The V accumulation
 
-The output contribution from one column tile of S is a weighted sum of V rows, where each weight is the softmax exponential of the corresponding score. Each thread holds the exponentials for 2 of the 8 K-tokens in the tile.
+Each thread accumulates the output contribution from one column tile of S by multiplying softmax weights against the corresponding V rows. My first implementation reduced these contributions with the same butterfly pattern used for the row maximum.
 
-My first implementation used the same butterfly reduce pattern used for the row maximum to accumulate the V contributions. That was wrong. The butterfly adds values from neighboring threads. Thread 0 accumulates for output column 0. Thread 1 accumulates for output column 2. After the butterfly, thread 0 was adding its column-0 contribution to thread 1's column-2 contribution. These are different output dimensions.
+The butterfly adds values from neighboring threads. Thread 0 accumulates for output column 0. Thread 1 accumulates for output column 2. After the butterfly, thread 0 was summing its column-0 contribution with thread 1's column-2 contribution. These are different output dimensions. The result was meaningless.
 
-The fix uses `__shfl_sync` to fetch each neighbor's exponentials explicitly, then multiplies them against the V values for this thread's own output columns. Four iterations, one per neighbor lane. Each iteration accumulates the V contribution for this thread's columns only, without touching other dimensions.
+The fix uses `__shfl_sync` to fetch each neighbor's softmax weights explicitly, then multiplies them against V values for this thread's own output columns only. No cross-dimension mixing.
 
-After this fix, the cosine reached 0.81 with random inputs.
+Cosine after fix: 0.81.
+
+### The race condition
+
+The kernel was launched with four blocks. Each block contained four warps covering 64 rows, exactly the full Q tile. Four blocks meant four independent groups all writing to the same output addresses with no coordination. Each block computed correct results and then overwrote the previous block's output.
+
+One block is enough.
+
+Cosine after fix: 0.81 confirmed. The remaining gap from 1.0 is quantization noise, not a bug. The validation in section 17 confirms this.
 
 ## 14. The Scale Layout
 
