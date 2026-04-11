@@ -423,17 +423,21 @@ After this fix: 8 non-zeros, correct diagonal positions for columns 0 through 7.
 
 ### The same class of error
 
-Adding the loop over all 8 column tiles to cover the full 64x64 matrix revealed the same problem in the K loading. The original code used `lane % 16` for the head-dimension index and `lane / 16` for the token index. Same result: only two distinct token groups, half the lanes loading duplicate data.
+With the A fragment correct, I extended the debug kernel to loop over all 8 column tiles and check the full 64x64 score matrix. The non-zero count dropped back to wrong values. A different fragment, the same mistake.
 
-The fix mirrors the A correction. `lane / 4` selects the token within the column tile, `lane % 4` selects the head-dimension subgroup. The two B registers cover the same token at K-column positions that are 16 apart.
+B is the K matrix, accessed as its transpose by the MMA `.col` modifier. Each thread loads a slice of K corresponding to one token and one range of head-dimension positions. My original code used `lane / 16` to select the token and `lane % 16` for the head-dimension offset. Two groups of 16 lanes, each duplicating the other within its group. Only two distinct tokens were ever loaded per tile. The rest of K was uninitialized memory.
+
+### The fix
+
+The correction follows the same logic as A. `lane / 4` selects the token within the column tile, giving 8 distinct token assignments. `lane % 4` selects the head-dimension subgroup, giving 4 distinct K-column ranges. The two B registers, b0 and b1, cover the same token at K-column positions 16 apart, mirroring the stride pattern from the A fragment.
 
 ### Confirmation
 
 After this fix: 64 non-zeros, S equals I_64 exactly.
 
-I confirmed with a second test using Q and K filled from the set {-2, -1, 0, 1, 2}. These values are all exactly representable in FP4 E2M1. Cosine similarity: 1.000000. Max absolute error: 0.000. The fragment loading was correct.
+A second test with Q and K filled from {-2, -1, 0, 1, 2}, values all exactly representable in FP4 E2M1, gave cosine similarity 1.000000 and max absolute error 0.000 across all 4096 elements of S. The fragment loading was correct.
 
-The identity matrix test took less than an afternoon to implement and confirmed both fixes in one run. The previous weeks of guessing produced nothing because I was testing the wrong thing.
+The identity matrix test took less than an afternoon to build. The previous weeks of guessing produced nothing because I had no way to see where the errors were. Once I could observe which specific cells in S were wrong, both fixes took less than an hour.
 
 ## 13. The Remaining Bugs
 
@@ -441,7 +445,7 @@ With the fragment layout validated on clean data, I moved the corrected loading 
 
 ### The K stride
 
-K is stored row-major in shared memory as `K_quant[token * Bd + head_dim]`, where `Bd` is 128. My indexing used `token * BQ + head_dim`, treating `BQ` (64) as the row stride instead of `Bd` (128). Every K access was reading from roughly half the correct address. The kernel was computing dot products between Q rows and completely wrong K bytes.
+The fragment loading reads from `K_quant`, the quantized K tile in shared memory. K is stored row-major: `K_quant[token * Bd + head_dim]`, where `Bd` is 128. My indexing used `token * BQ` instead, treating `BQ` (64) as the stride between tokens. Every K access was reading from roughly half the correct address in shared memory. The kernel was computing dot products between Q rows and bytes from the wrong tokens.
 
 Fix: replace `BQ` with `Bd` in the K stride.
 
@@ -449,7 +453,7 @@ Cosine after fix: still 0.06. The next bug was masking any improvement.
 
 ### The K scale index
 
-The scale array for K is indexed by token first, then by k_tile. The stride between tokens is `Bd / BLOCK_ELEMENT`, which is 4. My code was using `BQ / BLOCK_ELEMENT` instead, which is 2. Every scale lookup was hitting the wrong position in `K_scales`, applying the wrong normalization factor to every K block.
+Each 32-element block of K has a scale factor stored in `K_scales`. The index into that array is `token * (Bd / BLOCK_ELEMENT) + k_tile`. The stride between tokens is `Bd / BLOCK_ELEMENT`, which is 4. My code used `BQ / BLOCK_ELEMENT` instead, which is 2. Every scale lookup was landing at the wrong position, applying an incorrect normalization factor to the K values before the MMA.
 
 Fix: replace `BQ` with `Bd` in the scale stride.
 
@@ -457,9 +461,9 @@ Cosine after fix: still 0.06. Two more bugs waiting.
 
 ### The scope errors
 
-`q_row0` was declared inside the k_tile loop. The output write, which happens after both loops, needed `q_row0` but it was out of scope. The compiler silently reused whatever value was on the stack at that point, producing output at arbitrary row positions.
+`q_row0` holds the output row index for this thread. It was declared inside the k_tile loop but needed by the output write that happens after both loops. Out of scope, the compiler silently reused whatever value was on the stack, writing output to arbitrary row positions.
 
-`out_col` was declared twice: once inside the n_tile loop and once in the output write. The second declaration shadowed the first. Since both used the same formula, the values happened to be the same, but the shadowing masked a real structural problem.
+`out_col` was declared twice: once inside the n_tile loop and once in the output write. The second declaration shadowed the first. Both used the same formula so the values were identical, but the shadowing masked a structural problem that would have caused bugs if the formula had ever changed.
 
 Both variables needed to be declared once before both loops.
 
@@ -467,54 +471,62 @@ Cosine after fix: still 0.06. One more.
 
 ### The lane collision
 
-The output write computed `q_row0 = warp_id * MMA_M + (lane % 16)`. With `lane % 16`, lane 0 and lane 16 both produce `q_row0 = 0`. They write to identical positions in the output array and one overwrites the other. Lanes 4 and 20 collide on row 1, lanes 8 and 24 on row 2, and so on. Half the output was being written twice and the other half was never written at all.
+The output write used `q_row0 = warp_id * MMA_M + (lane % 16)`. With `lane % 16`, lane 0 and lane 16 both compute `q_row0 = 0` and write to the same memory address. Lane 4 and lane 20 both write to row 1, lanes 8 and 24 to row 2, and so on. Every row was being written twice by two different threads, one overwriting the other.
 
-The correct formula is `lane / 4`, which assigns each unique row to exactly one group of four lanes with no collisions.
+The correct formula is `lane / 4`, which gives each row a unique group of four lanes. No two threads write to the same address.
 
-Cosine after fix: 0.19. The output was wrong but no longer completely random. The V accumulation was now the dominant error.
+Cosine after fix: 0.19. The output was wrong but no longer completely random.
 
 ### The V accumulation
 
-Each thread accumulates the output contribution from one column tile of S by multiplying softmax weights against the corresponding V rows. My first implementation reduced these contributions with the same butterfly pattern used for the row maximum.
+With S computed correctly in registers, the kernel accumulates the attention output as `O = softmax(S) times V`. Each thread is responsible for two output columns. For each column tile of S, it needs to sum the softmax-weighted V rows across all eight K-tokens in that tile.
 
-The butterfly adds values from neighboring threads. Thread 0 accumulates for output column 0. Thread 1 accumulates for output column 2. After the butterfly, thread 0 was summing its column-0 contribution with thread 1's column-2 contribution. These are different output dimensions. The result was meaningless.
+The problem: each thread only holds the softmax weights for two of those eight tokens. The other six are in neighboring threads. My first implementation used the butterfly reduce to collect the V contributions, the same pattern used earlier for the row maximum. That was the wrong operation here.
 
-The fix uses `__shfl_sync` to fetch each neighbor's softmax weights explicitly, then multiplies them against V values for this thread's own output columns only. No cross-dimension mixing.
+The butterfly adds values from neighboring threads. Thread 0 accumulates for output column 0. Thread 1 accumulates for output column 2. After the butterfly, thread 0 was adding its column-0 contribution to thread 1's column-2 contribution. Different output dimensions mixed together. The result had no meaning.
+
+The correct approach is different: each thread uses `__shfl_sync` to fetch the softmax weights from its three neighbors explicitly, then multiplies each neighbor's weights against the V values for its own output columns. The accumulation stays local to each thread's assigned dimensions. No cross-dimension mixing.
 
 Cosine after fix: 0.81.
 
 ### The race condition
 
-The kernel was launched with four blocks. Each block contained four warps covering 64 rows, exactly the full Q tile. Four blocks meant four independent groups all writing to the same output addresses with no coordination. Each block computed correct results and then overwrote the previous block's output.
+The kernel was launched with four blocks of 128 threads each. One block already covers the full 64-row Q tile: four warps times 16 rows each. Four blocks meant four independent groups of threads all writing to the same output array simultaneously, with the last writer winning arbitrarily.
 
 One block is enough.
 
-Cosine after fix: 0.81 confirmed. The remaining gap from 1.0 is quantization noise, not a bug. The validation in section 17 confirms this.
+Cosine after fix: 0.81 confirmed. The remaining gap from 1.0 is quantization noise, not a correctness issue. Section 17 confirms this.
 
 ## 14. The Scale Layout
 
 ### The same problem
 
-One register per thread for `scale_a`, one for `scale_b`. But A has 16 rows and each needs its own scale. B has 8 columns and each needs its own scale. A single `uint32_t` per thread cannot hold all of that. The hardware must be reading specific bytes from specific lanes, but the PTX ISA does not document which ones for this instruction variant.
+The MMA instruction takes one `uint32_t` per thread for `scale_a` and one for `scale_b`. But the A tile has 16 rows and each row needs its own scale factor. The B tile has 8 columns and each column needs its own scale. One register per thread cannot hold all of that.
+
+The hardware must be reading specific bytes from specific lanes, distributing the scale responsibility across the warp just as it distributes the fragment data. But the PTX ISA does not document this mapping for `mxf8f6f4 m16n8k32` on SM120.
+
+The same situation as the fragment layout. The same approach.
 
 ### The probing method
 
-Same approach as the fragment layout: probe empirically.
+I filled Q and K with all 1.0 and set all scales to 127, which is `2^(127-127) = 1.0`. With all inputs equal to 1.0 and scale equal to 1.0, every MMA output is 32.0: the sum of 32 multiplications of 1.0 times 1.0.
 
-I filled Q and K with all 1.0 and set all scales to 127, which corresponds to 2 to the power of 0, meaning scale equals 1.0. The baseline output is 32.0 everywhere. Then I ran the kernel 32 times. Each run set exactly one lane's `scale_a` to 128, meaning scale equals 2.0, while all other lanes kept 127. If the hardware reads lane L's scale for row R, then row R of the output doubles from 32.0 to 64.0.
+Then I ran the kernel 32 times. Each run set exactly one lane's `scale_a` to 128, which is `2^(128-127) = 2.0`, while all other lanes kept 127. If lane L's scale register controls row R of the output, then row R doubles from 32.0 to 64.0. I recorded which rows changed for each target lane.
 
 ### The results
 
 | Lane condition | Row affected |
 | --- | --- |
-| lane % 4 == 0 | lane / 4, covering rows 0 through 7 |
-| lane % 4 == 1 | lane / 4 + 8, covering rows 8 through 15 |
+| lane % 4 == 0 | lane / 4, rows 0 through 7 |
+| lane % 4 == 1 | lane / 4 + 8, rows 8 through 15 |
 | lane % 4 == 2 | no effect |
 | lane % 4 == 3 | no effect |
 
-The same probing on `scale_b` showed that only lanes where `lane % 4 == 0` have any effect, and lane L controls column `lane / 4`.
+The same probing on `scale_b`: only lanes where `lane % 4 == 0` have any effect, and lane L controls column `lane / 4`.
 
-This is consistent with the A fragment structure. The register `a0` covers row0 and its scale is read from the lane with `lane % 4 == 0`. The register `a1` covers row0+8 and its scale comes from `lane % 4 == 1`. Lanes 2 and 3 contribute data through their A registers but the hardware ignores whatever scale value they hold.
+This is consistent with the A fragment structure established in section 11. The register `a0` covers row0 and its scale is supplied by the lane with `lane % 4 == 0`. The register `a1` covers row0+8 and its scale comes from `lane % 4 == 1`. Lanes 2 and 3 load fragment data normally through their A registers, but the hardware does not read their scale values. They are silently ignored.
+
+This also resolved a secondary issue from the original code. The kernel had been packing the scale byte four times into the `uint32_t`: `sa | (sa << 8) | (sa << 16) | (sa << 24)`. This happened to work because the hardware reads byte 0 of the register, and packing the same byte four times keeps byte 0 correct. Once the actual mapping was clear, the cast became a direct `(uint32_t)sa`. Same result, explicit intent.
 
 ## 15. Online Softmax and the Accumulation of V
 
