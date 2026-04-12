@@ -22,9 +22,9 @@ The attention mechanism in transformers scales quadratically with sequence lengt
 
 That is roughly a 4x advantage going from FP16 to FP4, and since FP4 values are four times smaller, you also move four times less data through memory. On paper, that is a massive win for attention. If you can actually use the FP4 Tensor Cores.
 
-The problem is that nobody has done this yet on consumer Blackwell(except 5090), so it has to be done for RTX 5080, RTX 5070 Ti, RTX 5070, RTX 5060 Ti. Existing fused attention kernels like SageAttention3 and FlashAttention-4 target SM100 (datacenter Blackwell). They use instructions and hardware features (`tcgen05.mma`, Tensor Memory) that simply do not exist on SM120. If you try to compile them for `sm_120`, they won't be op[timized.
+The problem is that nobody has done this yet on consumer Blackwell(except 5090), so it has to be done for RTX 5080, RTX 5070 Ti, RTX 5070, RTX 5060 Ti. Existing fused attention kernels like SageAttention3 and FlashAttention-4 target SM100 (datacenter Blackwell). They use instructions and hardware features (`tcgen05.mma`, Tensor Memory) that simply do not exist on SM120. If you try to compile them for `sm_120`, it won't be somehow optimized.
 
-There are non-fused FP4 kernels out there for this UC. For example [VincentKaufmann fp4-cuda-kernel](https://github.com/VincentKaufwormann/fp4-cuda-kernel) reaches about 143 TFLOPS. But non-fused means you compute QxK, write the full NxN score matrix to VRAM, read it back, apply softmax, write again, then compute the attention output. For 4096 tokens, that score matrix alone is 64 MB. On a 12 GB card, that is a dealbreaker.
+Also, there are non-fused FP4 kernels out there for this UC. For example [VincentKaufmann fp4-cuda-kernel](https://github.com/VincentKaufwormann/fp4-cuda-kernel) reaches about 143 TFLOPS. But non-fused means you compute QxK, write the full NxN score matrix to VRAM, read it back, apply softmax, write again, then compute the attention output. For 4096 tokens, that score matrix alone is 64 MB. On a 12 GB card, that is a dealbreaker.
 
 The whole point of a *fused* kernel is to keep the intermediate score matrix in registers and never write it to global memory. That is what FlashAttention does for FP16 and I wanted to do the same thing for FP4.
 
@@ -40,7 +40,27 @@ I considered three approaches:
 
 I went with **Option A**. The trade-off is clear: more manual work, more room for bugs, but absolute certainty about where every value lives. For a fused kernel where the entire point is keeping data in registers, that certainty is worth it.
 
-## 3. Picking the Right MMA Instruction
+## 3. What the Kernel Needs to Do
+
+Before writing a single line of code, it helps to map out the full problem.
+
+A fused FP4 attention kernel has to solve five things in sequence, and each one has a hardware dependency that constrains everything that follows.
+
+**Load the input tiles.** Q, K, and V are too large to fit in registers. They live in global memory and must be loaded into shared memory tile by tile. The size of each tile is bounded by the shared memory budget per SM, which on SM120 turns out to be 99 KiB and not the 128 KiB I initially assumed.
+
+**Quantize on the fly.** The Tensor Core does not consume float32. Before running the matrix multiply, each tile must be converted to FP4 E2M1 and its block scale factors must be computed. This has to happen in shared memory, which means a two-pass approach: load the tile as float32 first, compute the scale, then encode.
+
+**Run the matrix multiply in FP4.** The core operation is S = Q times K-transpose, computed with FP4 Tensor Cores. The score matrix S is 64 times 64 floats and must never be written to global memory. It lives entirely in registers across the warp throughout the computation. This is the register pressure constraint that drives every tile size decision.
+
+**Apply online softmax.** Softmax over a full row of S requires knowing the row maximum. But in the MMA output layout, each row is distributed across four threads. That forces a cross-thread reduction before every softmax step, using warp shuffle instructions.
+
+**Accumulate the output.** The final output O is computed as softmax(S) times V. This second matrix multiply accumulates incrementally as each column tile of S is processed, again never materializing the full score matrix.
+
+Each of these steps depends on knowing exactly which MMA instruction is available on SM120, what register layout it expects, and what quantization format it accepts.
+
+That is what the next section is about.
+
+## 4. Picking the Right MMA Instruction
 
 This is where I hit the first major wall. I started by reading the PTX ISA docs looking for FP4 MMA instructions on Blackwell. The datacenter SM100 chips use `tcgen05.mma`, a new-generation instruction that operates on large tiles and uses a dedicated hardware unit called Tensor Memory. I assumed SM120 would have something similar.
 
@@ -68,7 +88,7 @@ First, the actual shared memory usage ended up closer to 49 KiB once the full qu
 Yes it was a new GPU to me and when it is new do not forget to check with... nvidia-smi -q | grep "Max Shared Memory" .
 Section 7 covers the shared memory layout in detail.
 
-## 4. Testing the MMA Instruction (and Everything That Went Wrong)
+## 5. Testing the MMA Instruction (and Everything That Went Wrong)
 
 Before building the full fused kernel, I needed to verify that a single FP4 MMA instruction actually works. The idea is simple: load known values into registers A and B, run the MMA, and check that the FP32 accumulators contain the expected result.
 
@@ -115,7 +135,7 @@ The `"=f"` constraints are FP32 output registers, `"r"` are 32-bit integer input
 
 With `a0 = a1 = 0x08080808` (all 1.0), `b0 = 0x08080808` (all 1.0), and scales set to 1.0 (`0x7F7F7F7F`, since UE8M0 byte 127 = 2^0 = 1.0), the result was 32.0 in every accumulator lane. That is 32 multiply-accumulates of 1.0 x 1.0, which is exactly right.
 
-## 5. Encoding FP32 to FP4 E2M1
+## 6. Encoding FP32 to FP4 E2M1
 
 Once the MMA worked with hardcoded constants, the next step was encoding arbitrary `float` values into FP4 E2M1 at runtime. The encoding function is covered in detail in a dedicated post on my [MXFP4 quantization kernel](https://florianmattana.com/posts/mxfp4_article/). 
 What follows here is a summary of the key points as they apply to this kernel.
@@ -177,7 +197,7 @@ uint32_t pack = e0 | (e1 << 8) | (e2 << 16) | (e3 << 24);
 
 End-to-end test: encode 1.0 into every position, pack, run MMA -> 32.0. Encode 2.0 -> 128.0. Both matched. The encoding function was correct.
 
-## 6. Block Scaling: Why the Encoding Function Is Not Enough
+## 7. Block Scaling: Why the Encoding Function Is Not Enough
 
 Here is the problem I ran into immediately: FP4 E2M1 maxes out at 6.0. If your input values are larger and in attention, they absolutely will be, everything above 5.0 clamps to 6.0 and you lose all relative differences. For example, `encode_fp4_e2m1(12.0f)` and `encode_fp4_e2m1(10.0f)` both return `0x1C` (6.0). That is catastrophic for attention scores where the relative ordering is everything.
 
@@ -229,7 +249,7 @@ On SM120, each scale factor covers a block of 32 elements along the K dimension.
 
 The kernel now has three validated building blocks: `encode_fp4_e2m1`, `compute_scale_ue8m0`, and the inline PTX MMA call. The next step is loading Q, K, V tiles into shared memory with async copies (`cp.async`) and wiring everything together into the fused attention loop.
 
-## 7. Assembling the Kernel: Where Things Got Real
+## 8. Assembling the Kernel: Where Things Got Real
 
 The three building blocks worked in isolation. Encoding, scaling, MMA, all validated with hardcoded test values. Now I had to wire them together into an actual kernel that loads real data from VRAM, quantizes it on the fly, and runs the Tensor Core multiply. This is where the gap between "I have working pieces" and "I have a working kernel" became very real.
 
@@ -346,7 +366,7 @@ for (int k_tile = 0; k_tile < K_TILES; k_tile++)
 
 The accumulators are both input and output. On the first k-chunk they are zero. Each subsequent MMA adds its partial product. After 4 iterations, `acc[0]` through `acc[3]` hold the final values for this thread's piece of the (16, 8) output fragment. Four warps, 8 column tiles each, 4 accumulators per thread: the full (64, 64) score matrix lives entirely in registers. No global memory was touched for the intermediate result. That was the whole point.
 
-## 8. The First Correctness Test
+## 9. The First Correctness Test
 
 ### The result
 
@@ -364,7 +384,7 @@ The most obvious candidate was the fragment loading. In section 7, I described l
 
 The issue with cosine as a diagnostic is that it gives you one number. It tells you whether the final answer is right or wrong. It tells you nothing about where it went wrong.
 
-## 9. The Fragment Layout Problem
+## 10. The Fragment Layout Problem
 
 ### No documentation
 
@@ -384,7 +404,7 @@ I tried `lane % 16` for the row index and `lane / 16` for the K-column group. I 
 
 The problem was not the guesses. The problem was the test.
 
-## 10. Finding the Right Diagnostic
+## 11. Finding the Right Diagnostic
 
 ### The identity matrix test
 
@@ -404,7 +424,7 @@ This test has two properties the attention test does not. First, 1.0 is exactly 
 
 For the first time, I could see where the problem was.
 
-## 11. Fixing the A Fragment
+## 12. Fixing the A Fragment
 
 ### The wrong register count
 
@@ -428,7 +448,7 @@ Running the identity matrix test after this fix: 8 non-zeros, on the diagonal at
 
 After this fix: 8 non-zeros, correct diagonal positions for columns 0 through 7.
 
-## 12. Fixing the B Fragment
+## 13. Fixing the B Fragment
 
 ### The same class of error
 
@@ -448,7 +468,7 @@ A second test with Q and K filled from {-2, -1, 0, 1, 2}, values all exactly rep
 
 The identity matrix test took less than an afternoon to build. The previous weeks of guessing produced nothing because I had no way to see where the errors were. Once I could observe which specific cells in S were wrong, both fixes took less than an hour.
 
-## 13. The Remaining Bugs
+## 14. The Remaining Bugs
 
 With the fragment layout validated on clean data, I moved the corrected loading code into the full kernel that uses shared memory and quantization. The cosine dropped back to 0.06. A different set of problems, same symptom.
 
@@ -506,7 +526,7 @@ One block is enough.
 
 Cosine after fix: 0.81 confirmed. The remaining gap from 1.0 is quantization noise, not a correctness issue. Section 17 confirms this.
 
-## 14. The Scale Layout
+## 15. The Scale Layout
 
 ### The same problem
 
@@ -537,7 +557,7 @@ This is consistent with the A fragment structure established in section 11. The 
 
 This also resolved a secondary issue from the original code. The kernel had been packing the scale byte four times into the `uint32_t`: `sa | (sa << 8) | (sa << 16) | (sa << 24)`. This happened to work because the hardware reads byte 0 of the register, and packing the same byte four times keeps byte 0 correct. Once the actual mapping was clear, the cast became a direct `(uint32_t)sa`. Same result, explicit intent.
 
-## 15. Online Softmax and the Accumulation of V
+## 16. Online Softmax and the Accumulation of V
 
 ### Why a warp reduction is unavoidable
 
