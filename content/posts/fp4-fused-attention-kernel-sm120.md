@@ -315,67 +315,32 @@ K gets the exact same treatment: load into `staging` (overwriting Q's FP32 data,
 
 ### The MMA fragment loading: the part I could not figure out alone
 
-This is where I spent the most time. The MMA instruction `mma.sync.m16n8k32` expects each of the 32 threads in a warp to hold specific bytes from the A and B matrices in its registers. Not just any bytes, the exact bytes that the hardware expects for that lane. The mapping is defined in the PTX ISA fragment layout tables, and it is not intuitive.
+This is where I spent the most time. The MMA instruction expects each of the 32 threads in a warp to hold specific bytes from the A and B matrices in its registers. Not just any bytes but the exact bytes that correspond to that thread's position in the matrix tile. The mapping is defined in the PTX ISA fragment layout tables.
+For fragment A, a [16 x 32] slice of Q, each thread holds registers that pack FP4 values in their 8-bit containers. The lane ID determines which row and which K-column range the thread is responsible for. The registers are not contiguous in memory: they cover two different K-column ranges separated by a stride of 16 columns.
 
-For fragment A (a 16x32 slice of Q), each thread holds two 32-bit registers: `a0` and `a1`. Each register packs 4 FP4 values in their 8-bit containers. The lane ID determines which row the thread reads from (`lane % 16` gives a row from 0 to 15, meaning lanes 0-15 and lanes 16-31 cover the same rows but different column groups). The two registers `a0` and `a1` are not contiguous in memory: they are separated by a stride of 16 columns.
+For fragment B, the K matrix accessed as its transpose, each thread holds registers covering one token and one range of head-dimension positions.
+The scale factors follow the same lane-based assignment: each thread looks up the scale for the block it loaded and passes it to the MMA.
 
-I first tried loading them contiguously, thinking `a0` covers columns 0-3 and `a1` covers columns 4-7. The MMA gave garbage. After going back to the ISA tables, I found that `a0` and `a1` are 16 columns apart, not 4. The columns in between are held by other threads in the warp.
-
-The working version:
-
-```cuda
-int q_row = warp_id * MMA_M + (lane % 16); int q_col = k_tile * MMA_K + (lane / 16) * BYTES_PER_REG;
-int q_idx_0 = q_row * Bd + q_col; int q_idx_1 = q_row * Bd + q_col + MMA_A_STRIDE;
-uint32_t a0 = Q_quant[q_idx_0] | (Q_quant[q_idx_0 + 1] << 8) | (Q_quant[q_idx_0 + 2] << 16) | (Q_quant[q_idx_0 + 3] << 24);
-uint32_t a1 = Q_quant[q_idx_1] | (Q_quant[q_idx_1 + 1] << 8) | (Q_quant[q_idx_1 + 2] << 16) | (Q_quant[q_idx_1 + 3] << 24);
-```
-
-`MMA_A_STRIDE = 16` is the gap between the two registers. `BYTES_PER_REG = 4` is how many 8-bit containers fit in one 32-bit register. These are hardware constants that I only discovered through trial and error and reading the ISA diagrams three times.
-
-Fragment B (a 32x8 slice of K) is simpler because each thread only loads one register:
-
-```cuda
-int k_row = k_tile * MMA_K + (lane % 16); int k_col = n_tile * MMA_N + (lane / 16) * BYTES_PER_REG;
-int k_idx_0 = k_row * BQ + k_col;
-uint32_t b0 = K_quant[k_idx_0] | (K_quant[k_idx_0 + 1] << 8) | (K_quant[k_idx_0 + 2] << 16) | (K_quant[k_idx_0 + 3] << 24);
-```
-
-The scale factors slot in naturally. Each thread looks up the scale for the scaling block that contains its loaded values and duplicates it four times across a `uint32_t`:
-
-```cuda
-uint8_t sa = Q_scales[q_row * (Bd / BLOCK_ELEMENT) + k_tile]; uint8_t sb = K_scales[k_row * (BQ / BLOCK_ELEMENT) + (n_tile * MMA_N) / BLOCK_ELEMENT]; uint32_t scale_a = sa | (sa << 8) | (sa << 16) | (sa << 24); uint32_t scale_b = sb | (sb << 8) | (sb << 16) | (sb << 24);
-```
+What I thought I understood at this stage turned out to be wrong in almost every detail. The register count, the lane grouping, the K stride, the scale index: all of it had to be corrected later through empirical testing. The code I had at this point compiled and passed isolated tests with hardcoded values, which masked the errors. Sections 11 through 14 document what was wrong and how it was fixed.
 
 ### The MMA loop
 
-With fragments loaded, the MMA itself is anticlimactic. It is the same `asm volatile` block from section 4, just wired into a loop. The outer loop covers 8 column fragments of S, the inner loop accumulates 4 k-chunks:
+With fragments loaded, the MMA itself is straightforward. The outer loop covers 8 column tiles of S, the inner loop accumulates 4 K-chunks along the head dimension:
 
-```cuda
-for (int n_tile = 0; n_tile < N_TILES; n_tile++) { float acc[ACC_PER_THREAD] = {0.f};
-for (int k_tile = 0; k_tile < K_TILES; k_tile++)
-{
-    // ... load a0, a1, b0, scale_a, scale_b ...
+```cpp
+for (int n_tile = 0; n_tile < N_TILES; n_tile++) {
+    float acc[ACC_PER_THREAD] = {0.f};
 
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4"
-        ".block_scale.scale_vec::1X.f32.e2m1.e2m1.f32.ue8m0"
-        " {%0, %1, %2, %3},"
-        " {%4, %5},"
-        " {%6},"
-        " {%7, %8, %9, %10},"
-        " %11,"
-        " %12;"
-        : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3])
-        : "r"(a0), "r"(a1),
-          "r"(b0),
-          "f"(acc[0]), "f"(acc[1]), "f"(acc[2]), "f"(acc[3]),
-          "r"(scale_a), "r"(scale_b)
-    );
-}
+    for (int k_tile = 0; k_tile < K_TILES; k_tile++) {
+        // load fragments and scales
+        // call asm volatile MMA
+    }
 }
 ```
 
-The accumulators are both input and output. On the first k-chunk they are zero. Each subsequent MMA adds its partial product. After 4 iterations, `acc[0]` through `acc[3]` hold the final values for this thread's piece of the (16, 8) output fragment. Four warps, 8 column tiles each, 4 accumulators per thread: the full (64, 64) score matrix lives entirely in registers. No global memory was touched for the intermediate result. That was the whole point.
+The accumulators are both input and output. On the first K-chunk they are zero. Each subsequent MMA adds its partial product. After 4 iterations, the accumulators hold the complete dot products for this thread's slice of the output tile. Four warps, 8 column tiles each, 4 accumulators per thread: the full [64 x 64] score matrix lives entirely in registers. No global memory is touched for the intermediate result. That is the whole point of the fused kernel.
+
+The code shown here is intentionally simplified. The correct register count, lane assignments, and index formulas are established in sections 11 through 14 after the correctness failures described in this section 8.
 
 ## 9. The First Correctness Test
 
