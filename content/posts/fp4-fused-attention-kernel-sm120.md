@@ -658,6 +658,102 @@ The kernel now handles arbitrary head dimensions, multiple heads, and batched in
 
 ---
 
-*What remains: causal masking, cp.async prefetching for K tiles, and a proper benchmark against cuBLAS and PyTorch SDPA. The kernel is functional enough to plug into a real inference loop. That is the next step.*
+## 20. Multi-Head Attention and Arbitrary Head Dimensions
+
+### The limitation
+
+Up to this point the kernel had three hard constraints that made it unusable on real models. The head dimension was fixed at 128. Each thread wrote only two output columns, which happened to match the test setup but was wrong for any real head dimension. And the kernel processed a single head with no concept of batch or head index.
+
+### Template parameter for head dimension
+
+Different models use different head dimensions. GPT-2 uses 64, LLaMA uses 128, some recent models use 256. Hardcoding 128 excludes most of them.
+
+The solution is a C++ template parameter. Instead of a fixed constant, the kernel becomes `template<int HEAD_DIM>`. The compiler generates a separate binary for each instantiation. `fused_fp4_attention<128>` and `fused_fp4_attention<64>` are two distinct kernels, each with their own compile-time constants for tile sizes, loop bounds, and register counts. No runtime branching, no overhead.
+
+The constraint is that `HEAD_DIM` must be a multiple of 32, which is the MMA reduction dimension. Values of 64, 96, 128, 160, and 256 all work. This is how CUTLASS handles the same problem.
+
+### The output accumulator bug
+
+Fixing the head dimension revealed a deeper problem. The original kernel kept two scalar accumulators per thread for the V output: `O0_c0` and `O0_c1`. That was correct when the output had 8 columns total, but wrong for any real head dimension.
+
+For `HEAD_DIM=128`, each thread is responsible for 32 output column pairs, not 2. The fix replaces the two scalars with an array `O0[V_COL_TILES * 2]` where `V_COL_TILES = HEAD_DIM / MMA_N`. The V accumulation becomes a loop over all output column tiles, and the online softmax rescaling must be applied to every element of that array at each update step.
+
+### Multi-head and batching
+
+Each block processes one `(batch, head)` pair independently:
+
+```cpp
+int batch_idx = blockIdx.x / heads;
+int head_idx  = blockIdx.x % heads;
+```
+
+The launch becomes `<<<batch * heads, NUM_THREADS>>>`. Each block computes its own offset into Q, K, V, and Out and works without coordination with other blocks.
+
+### Validation
+
+| Config | Result |
+| --- | --- |
+| head_dim=128, seq_k=64, 1 head | cosine 1.0000 PASS |
+| head_dim=128, seq_k=128, 1 head | cosine 1.0000 PASS |
+| head_dim=64, seq_k=64, 1 head | cosine 1.0000 PASS |
+| head_dim=64, seq_k=128, 1 head | cosine 1.0000 PASS |
+| head_dim=128, seq_k=128, batch=1 heads=4 | cosine 1.0000 PASS |
+| head_dim=128, seq_k=128, batch=2 heads=4 | cosine 1.0000 PASS |
+
+## 21. First Benchmark and the NCU Diagnosis
+
+### The numbers
+
+With the kernel functionally complete, I ran a first benchmark on the RTX 5070 Ti.
+Configuration: batch=1, heads=32, seq_q=64.
+
+| head_dim | seq_k | kern_ms | TFLOPS | BW GB/s |
+| --- | --- | --- | --- | --- |
+| 128 | 128 | 0.072 | 1.87 | 87.8 |
+| 128 | 512 | 0.255 | 2.11 | 74.0 |
+| 128 | 1024 | 0.530 | 2.03 | 67.3 |
+| 64 | 128 | 0.037 | 1.82 | 85.2 |
+| 64 | 512 | 0.102 | 2.62 | 92.1 |
+| 64 | 1024 | 0.192 | 2.80 | 92.9 |
+
+The RTX 5070 Ti has a theoretical FP4 throughput of 474 TFLOPS. We are at 2.8, which is 0.6% utilization. Before optimizing, I needed to know exactly where the time was going.
+
+### What NCU said
+
+The first metric that jumped out was "No Eligible" at 95.23%. This means the warp scheduler found no warp ready to execute 95% of the time. The GPU was spending almost all its time waiting.
+
+*A warp scheduler looks for eligible warps — warps that have their input data ready and can execute an instruction. When none are eligible, the SM is idle. High "No Eligible" is the definition of a latency-bound kernel.*
+
+The occupancy was 7.94% against a theoretical maximum of 8.33%. The reason:
+Block Limit Shared Mem  : 2 blocks per SM
+Block Limit Registers   : 8 blocks per SM
+
+The shared memory was the binding constraint. With 41 KB of static shared memory per block and 99 KiB available per SM, only 2 blocks could fit per SM simultaneously. With 2 blocks of 2 warps each, the SM had 4 active warps. A GPU needs roughly 32 warps per SM to fully hide memory latencies.
+
+The long scoreboard stall was at 81%. Warps were stalling on data from global memory.
+The culprit was V: the V accumulation loop was accessing V directly from global memory inside a double loop, generating thousands of uncoalesced accesses per thread.
+
+### The fix: V in shared memory
+
+The solution was to load each V tile into shared memory before the MMA loop, exactly as K is loaded. This adds 32 KB to the shared memory budget for HEAD_DIM=128, bringing the total to about 80 KB. The double buffering for K was removed to fit within the 99 KiB limit.
+
+After this change, the TFLOPS roughly doubled:
+
+| head_dim | seq_k | before | after |
+| --- | --- | --- | --- |
+| 128 | 1024 | 1.26 TFLOPS | 2.03 TFLOPS |
+| 64 | 1024 | 1.41 TFLOPS | 2.80 TFLOPS |
+
+The bandwidth on the kernel side went from ~50 GB/s to ~92 GB/s on the best configurations, confirming that the V global memory accesses were the dominant stall.
+
+### What NCU says now
+
+After loading V into shared memory, the new binding constraint is occupancy. With 80 KB of shared memory per block, only 1 block can fit per SM instead of 2. Combined with 128 registers per thread — driven by the large `O0` accumulator array the theoretical occupancy stays at 8.33%.
+
+The kernel is still latency-bound, but for a different reason. The shared memory budget is now the wall. Reducing it requires either a smaller tile size or a different strategy for the output accumulator. That is the next step.
+
+---
+
+*The kernel at this point is functionally complete and has been through one round of profiling-driven optimization. It computes fused FP4 attention correctly across arbitrary head dimensions, batch sizes, and sequence lengths. The gap to the 474 TFLOPS theoretical peak is real and documented. The next section covers the path toward closing it.*
 
 *Code: [github.com/florianmattana/fp4-fused-attention-sm120](https://github.com/florianmattana/fp4-fused-attention-sm120)*
