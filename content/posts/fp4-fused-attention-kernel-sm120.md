@@ -658,54 +658,11 @@ The kernel now handles arbitrary head dimensions, multiple heads, and batched in
 
 ---
 
-## 20. Multi-Head Attention and Arbitrary Head Dimensions
-
-### The limitation
-
-Up to this point the kernel had three hard constraints that made it unusable on real models. The head dimension was fixed at 128. Each thread wrote only two output columns, which happened to match the test setup but was wrong for any real head dimension. And the kernel processed a single head with no concept of batch or head index.
-
-### Template parameter for head dimension
-
-Different models use different head dimensions. GPT-2 uses 64, LLaMA uses 128, some recent models use 256. Hardcoding 128 excludes most of them.
-
-The solution is a C++ template parameter. Instead of a fixed constant, the kernel becomes `template<int HEAD_DIM>`. The compiler generates a separate binary for each instantiation. `fused_fp4_attention<128>` and `fused_fp4_attention<64>` are two distinct kernels, each with their own compile-time constants for tile sizes, loop bounds, and register counts. No runtime branching, no overhead.
-
-The constraint is that `HEAD_DIM` must be a multiple of 32, which is the MMA reduction dimension. Values of 64, 96, 128, 160, and 256 all work. This is how CUTLASS handles the same problem.
-
-### The output accumulator bug
-
-Fixing the head dimension revealed a deeper problem. The original kernel kept two scalar accumulators per thread for the V output: `O0_c0` and `O0_c1`. That was correct when the output had 8 columns total, but wrong for any real head dimension.
-
-For `HEAD_DIM=128`, each thread is responsible for 32 output column pairs, not 2. The fix replaces the two scalars with an array `O0[V_COL_TILES * 2]` where `V_COL_TILES = HEAD_DIM / MMA_N`. The V accumulation becomes a loop over all output column tiles, and the online softmax rescaling must be applied to every element of that array at each update step.
-
-### Multi-head and batching
-
-Each block processes one `(batch, head)` pair independently:
-
-```cpp
-int batch_idx = blockIdx.x / heads;
-int head_idx  = blockIdx.x % heads;
-```
-
-The launch becomes `<<<batch * heads, NUM_THREADS>>>`. Each block computes its own offset into Q, K, V, and Out and works without coordination with other blocks.
-
-### Validation
-
-| Config | Result |
-| --- | --- |
-| head_dim=128, seq_k=64, 1 head | cosine 1.0000 PASS |
-| head_dim=128, seq_k=128, 1 head | cosine 1.0000 PASS |
-| head_dim=64, seq_k=64, 1 head | cosine 1.0000 PASS |
-| head_dim=64, seq_k=128, 1 head | cosine 1.0000 PASS |
-| head_dim=128, seq_k=128, batch=1 heads=4 | cosine 1.0000 PASS |
-| head_dim=128, seq_k=128, batch=2 heads=4 | cosine 1.0000 PASS |
-
-## 21. First Benchmark and the NCU Diagnosis
+## 20. First Benchmark and the NCU Diagnosis
 
 ### The numbers
 
-With the kernel functionally complete, I ran a first benchmark on the RTX 5070 Ti.
-Configuration: batch=1, heads=32, seq_q=64.
+With the kernel functionally complete, I ran a first benchmark on the RTX 5070 Ti. Configuration: batch=1, heads=32, seq_q=64.
 
 | head_dim | seq_k | kern_ms | TFLOPS | BW GB/s |
 | --- | --- | --- | --- | --- |
