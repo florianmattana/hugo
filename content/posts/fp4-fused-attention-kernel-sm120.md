@@ -590,4 +590,21 @@ Validation with two test cases confirms correctness. With `seq_k = 64` (single t
 
 The kernel now processes attention over arbitrary key sequence lengths, in multiples of 64 tokens.
 
+## 18. Softmax Scaling
+
+The attention formula is softmax(Q×Kᵀ / sqrt(d)) × V. The division by sqrt(d) was missing from the kernel until this point.
+
+Without it, the scores in S grow with the head dimension. Each score is a dot product of two vectors of length d. If Q and K have values around 1, the scores are on the order of sqrt(d) — for d=128, that is around 11. Feeding large values into softmax pushes it toward saturation: the maximum score gets a weight close to 1 and everything else collapses toward 0. The attention output becomes a near-copy of the V row corresponding to the single highest score, losing all the nuance of the weighted average.
+
+Dividing by sqrt(d) brings the scores back to order of magnitude 1 before the softmax, keeping the output distribution balanced.
+
+In the kernel, this is a single multiply applied to the four accumulators immediately after the inner k_tile loop and before the softmax reduction:
+
+```cpp
+for (int i = 0; i < ACC_PER_THREAD; i++)
+    acc[i] *= softmax_scale;  // softmax_scale = 1/sqrt(Bd) = 1/sqrt(128)
+```
+
+The CPU reference was updated to apply the same scaling, and both test cases pass at cosine 1.0000.
+
 *Code: [github.com/florianmattana/fp4-fused-attention-sm120](https://github.com/florianmattana/fp4-fused-attention-sm120)*
