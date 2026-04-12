@@ -50,7 +50,7 @@ A fused FP4 attention kernel has to solve five things in sequence, and each one 
 
 **Quantize on the fly.** The Tensor Core does not consume float32. Before running the matrix multiply, each tile must be converted to FP4 E2M1 and its block scale factors must be computed. This has to happen in shared memory, which means a two-pass approach: load the tile as float32 first, compute the scale, then encode.
 
-**Run the matrix multiply in FP4.** The core operation is S = Q times K-transpose, computed with FP4 Tensor Cores. The score matrix S is 64 times 64 floats and must never be written to global memory. It lives entirely in registers across the warp throughout the computation. This is the register pressure constraint that drives every tile size decision.
+**Run the matrix multiply in FP4.** The core operation is S = Q times K-transpose, computed with FP4 Tensor Cores. The score matrix S is 64 times 64 floats and must never be written to global memory.It lives entirely in registers across the warp throughout the computation. A warp is a group of 32 threads that execute together on the GPU, the fundamental unit of execution on Tensor Cores.
 
 **Apply online softmax.** Softmax over a full row of S requires knowing the row maximum. But in the MMA output layout, each row is distributed across four threads. That forces a cross-thread reduction before every softmax step, using warp shuffle instructions.
 
@@ -86,7 +86,7 @@ The fused kernel will process tiles of Q, K, V through shared memory, roughly 9 
 
 First, the actual shared memory usage ended up closer to 49 KiB once the full quantization pipeline was in place. Second, the available budget on SM120 is not 128 KB as I'd assumed from the general Blackwell documentation, but 99 KiB. I found this while browsing open CUTLASS issues: [issue #3144](https://github.com/NVIDIA/cutlass/issues/3144), titled "StageCountAutoCarveout assumes max family SMEM, breaks SM121 (99 KiB vs SM120 228 KiB)", reporteda bug where CUTLASS was incorrectly assuming all SM12x GPUs share the same shared memory size. A contributor clarified in the thread that SM120 consumer Blackwell has 99 KiB, while SM100 datacenter Blackwell has 228 KiB. The distinction matters: at 49 KiB, the kernel fits within the 99 KiB optin budget, but only just. 
 
-Yes it was a new GPU to me and when it is new do not forget to check with... nvidia-smi -q | grep "Max Shared Memory".
+The distinction matters: at 49 KiB, the kernel fits within the 99 KiB optin budget but only just. On any new GPU, checking the actual shared memory limit with `nvidia-smi -q | grep "Max Shared Memory"` before making assumptions about the budget would have saved me time. Section 8 covers the shared memory layout in detail.
 
 Section 7 covers the shared memory layout in detail.
 
@@ -251,7 +251,7 @@ On SM120, each scale factor covers a block of 32 elements along the K dimension.
 
 ---
 
-The kernel now has three validated building blocks: `encode_fp4_e2m1`, `compute_scale_ue8m0`, and the inline PTX MMA call. The next step is loading Q, K, V tiles into shared memory with async copies (`cp.async`) and wiring everything together into the fused attention loop.
+The kernel now has three validated building blocks: `encode_fp4_e2m1`,`compute_scale_ue8m0`, and the inline PTX MMA call. The next step is loading Q, K, V tiles into shared memory and wiring everything together into the fused attention loop.
 
 ## 8. Assembling the Kernel: Where Things Got Real
 
@@ -299,14 +299,17 @@ I wanted to quantize the floats as I loaded them from VRAM, avoiding the staging
 So quantization has to be a separate pass after loading. The staging buffer exists specifically because of this dependency. First load everything as FP32, barrier, then quantize in a second pass where each thread handles complete 32-element blocks:
 
 ```cuda
-for (int i = tid; i < NUM_SCALE_BLOCKS; i += NUM_THREADS) { uint8_t scale = compute_scale_ue8m0(&staging[i * BLOCK_ELEMENT]); Q_scales[i] = scale; float scale_f = exp2f((float)(scale - 127));
+for (int i = tid; i < NUM_SCALE_BLOCKS; i += NUM_THREADS) {
+    uint8_t scale   = compute_scale_ue8m0(&staging[i * BLOCK_ELEMENT]);
+    Q_scales[i]     = scale;
+    float   scale_f = exp2f((float)(scale - 127));
 
-for (int j = 0; j < BLOCK_ELEMENT; j++)
-{
-    float val = staging[i * BLOCK_ELEMENT + j] / scale_f;
-    Q_quant[i * BLOCK_ELEMENT + j] = encode_fp4_e2m1(val);
+    for (int j = 0; j < BLOCK_ELEMENT; j++) {
+        float val = staging[i * BLOCK_ELEMENT + j] / scale_f;
+        Q_quant[i * BLOCK_ELEMENT + j] = encode_fp4_e2m1(val);
+    }
 }
-} __syncthreads();
+__syncthreads();
 ```
 
 256 scaling blocks, 128 threads, 2 blocks per thread. Each thread processes its blocks sequentially, scanning for the max, computing the scale, dividing, and encoding all 32 values. It is not fast, there is a lot of branching in `encode_fp4_e2m1` and the inner loop is purely sequential, but it works. Optimization comes later.
@@ -346,7 +349,7 @@ The code shown here is intentionally simplified. The correct register count, lan
 
 ### The result
 
-Section 7 ended with the MMA loop assembled and the score matrix living in registers. I ran the correctness test against a float32 CPU reference.
+Section 8 ended with the MMA loop assembled and the score matrix living in registers. I ran the correctness test against a float32 CPU reference.
 
 Cosine similarity: 0.06.
 
@@ -364,7 +367,7 @@ The issue with cosine as a diagnostic is that it gives you one number. It tells 
 
 ### No documentation
 
-To understand what went wrong, it helps to understand what a fragment actually is. When the GPU executes an MMA instruction, the 32 threads in a warp collectively own a tile of the A matrix, a tile of B, and the accumulator tile D. Each individual thread holds a specific slice of that tile in its registers. That slice is the thread's fragment. The hardware defines precisely which matrix positions belong to which thread, a mapping called the fragment layout.
+The fragment layout — the mapping between lane IDs and matrix positions is defined by the hardware for every MMA instruction variant. The hardware defines precisely which matrix positions belong to which thread.
 
 For FP16 and BF16 MMA variants, NVIDIA documents these layouts with diagrams in the PTX ISA specification. For `mxf8f6f4 m16n8k32` on SM120, those diagrams do not exist. The instruction is listed, the operand counts are given, but the per-lane mapping is absent.
 
@@ -419,8 +422,6 @@ The correct formula is `lane % 4`, which creates four groups of eight threads. E
 
 With `lane / 4` for the row and `lane % 4` for the K-column subgroup, each of the32 threads gets a unique assignment: 8 row positions times 4 K-column groups. No two threads duplicate each other's work and no position in the A tile goes unloaded.
 The four registers follow a pattern that is worth making explicit because it is easy to get wrong. The first two registers, a0 and a1, cover the same K-column range but different rows: a0 for row0, a1 for row0+8. The second two registers, a2 and a3, shift the K-columns by 16 and repeat the same row pattern: a2 for row0, a3 for row0+8. The row alternates across registers rather than incrementing, which is the opposite of what feels natural.
-
-Running the identity matrix test after this fix: 8 non-zeros, on the diagonal at the correct positions for columns 0 through 7.
 
 After this fix: 8 non-zeros, correct diagonal positions for columns 0 through 7.
 
@@ -565,17 +566,17 @@ The kernel was launched with four blocks and 128 threads per block. Four blocks 
 
 ### Validation
 
-With one block, the cosine was 0.81 with random inputs in the range [-1, 1]. To confirm this was quantization loss and not a remaining bug, I used inputs from the set {-1.0, -0.5, 0.0, 0.5, 1.0}. These are exactly representable in FP4 E2M1, so quantization is lossless and the GPU and CPU see identical data.
+At this point every correctness bug had been fixed. The V accumulation and race condition bugs are documented in section 14 — they were resolved before the softmax was wired in. With those fixes in place, the full pipeline from Q and K loading to softmax to V accumulation produced: 
 cosine similarity : 1.0000  PASS
 ref[0..7] : -0.446  -0.879  -0.450   0.511   0.940   0.968  -0.947  -0.049
 out[0..7] : -0.446  -0.879  -0.450   0.511   0.940   0.968  -0.947  -0.049
 
-Bit-exact. Every element matches.
+Bit-exact. This confirms that the entire pipeline is correct: FP4 quantization, block scaling, MMA fragment loading, online softmax, and V accumulation all produce the right answer when given inputs that are exactly representable in FP4 E2M1.
 
-The 0.81 is the intrinsic precision cost of MXFP4 at `scale_vec::1X` granularity. FP4 E2M1 has only eight representable magnitudes. With one scale covering 32 elements, a single outlier in a block sets the scale for all 32 values and the remaining ones lose resolution. For inputs uniform in [-1, 1], roughly a quarter of values round to zero after block scaling. The CPU reference operates on the original float32 values, so the comparison is unfair. The kernel is correct. The 0.81 is an architectural constraint, not a bug.
+The 0.81 cosine observed earlier with random inputs in [-1, 1] is the intrinsic precision cost of MXFP4 at `scale_vec::1X` granularity. FP4 E2M1 has only eight representable magnitudes. With one scale covering 32 elements, a single outlier sets the scale for the entire block and the remaining values lose resolution. The CPU reference operates on the original float32 values, so the comparison is unfair. The kernel is correct. The 0.81 is an architectural constraint, not a bug.
 
 ---
 
-*The kernel now correctly computes fused FP4 attention for a single Q tile against a single K tile, with the full score matrix living in registers throughout. What remains is extending K loading across multiple sequence tiles, adding asynchronous prefetching with cp.async, and extending V to use FP4 quantization for the second GEMM. That is the next section.*
+*The kernel now correctly computes fused FP4 attention for a single Q tile against a single K tile, with the full score matrix living in registers throughout. What remains is extending K loading across multiple sequence tiles, adding asynchronous prefetching with `cp.async`, and extending V to use FP4 quantization for the second GEMM. The kernel is a work in progress — this article will be updated as those pieces come together.*
 
 *Code: [github.com/florianmattana/fp4-fused-attention-sm120](https://github.com/florianmattana/fp4-fused-attention-sm120)*
