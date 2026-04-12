@@ -84,8 +84,10 @@ Discovering that cost several weeks of debugging, and section 11 explains how.
 
 The fused kernel will process tiles of Q, K, V through shared memory, roughly 9 KB by my initial estimate. That number turned out to be wrong in two ways.
 
-First, the actual shared memory usage ended up closer to 49 KiB once the full quantization pipeline was in place. Second, the available budget on SM120 is not 128 KB as I had assumed from the general Blackwell documentation, but 99 KiB. I found this while browsing open CUTLASS issues: [issue #3144](https://github.com/NVIDIA/cutlass/issues/3144), titled "StageCountAutoCarveout assumes max family SMEM, breaks SM121 (99 KiB vs SM120 228 KiB)", reporteda bug where CUTLASS was incorrectly assuming all SM12x GPUs share the same shared memory size. A contributor clarified in the thread that SM120 consumer Blackwell has 99 KiB, while SM100 datacenter Blackwell has 228 KiB. The distinction matters: at 49 KiB, the kernel fits within the 99 KiB optin budget, but only just.
-Yes it was a new GPU to me and when it is new do not forget to check with... nvidia-smi -q | grep "Max Shared Memory" .
+First, the actual shared memory usage ended up closer to 49 KiB once the full quantization pipeline was in place. Second, the available budget on SM120 is not 128 KB as I'd assumed from the general Blackwell documentation, but 99 KiB. I found this while browsing open CUTLASS issues: [issue #3144](https://github.com/NVIDIA/cutlass/issues/3144), titled "StageCountAutoCarveout assumes max family SMEM, breaks SM121 (99 KiB vs SM120 228 KiB)", reporteda bug where CUTLASS was incorrectly assuming all SM12x GPUs share the same shared memory size. A contributor clarified in the thread that SM120 consumer Blackwell has 99 KiB, while SM100 datacenter Blackwell has 228 KiB. The distinction matters: at 49 KiB, the kernel fits within the 99 KiB optin budget, but only just. 
+
+Yes it was a new GPU to me and when it is new do not forget to check with... nvidia-smi -q | grep "Max Shared Memory".
+
 Section 7 covers the shared memory layout in detail.
 
 ## 5. Testing the MMA Instruction (and Everything That Went Wrong)
@@ -100,11 +102,13 @@ My first attempt used `m16n8k64` and I reasoned that since FP4 values are 4 bits
 
 ### The encoding bug that cost me a full day
 
-FP4 E2M1 encodes the value 1.0 as the 4-bit pattern `0b1000`. Since this nibble must sit in bits 5-2 of the 8-bit container, the correct byte for 1.0 is `0x08` not `0x02`, which is what you would get if you just placed the nibble in bits 3-0.
+FP4 E2M1 encodes the value 1.0 as the 4-bit pattern `0b1000`. The container is an 8-bit byte, and the nibble must sit in bits 5-2, not bits 3-0. That means the correct byte for 1.0 is `0x08`: the pattern `0b00001000`, with the nibble in the upper half of the low byte. If you place the nibble in bits 3-0 instead, you get `0x02`, which the hardware reads as a completely different value.
 
-I initially filled every register with `0x22222222`, thinking I was encoding 2.0 in each position. The MMA gave me 2.0 in the accumulators instead of the 32.0 I expected. After staring at bit layouts for longer than I would like to admit, I realized the nibble was in the wrong position. Switching to `0x08080808` (1.0 in the correct bit position) and expecting 32.0. That worked.
+I initially filled every register with `0x22222222`, four bytes of `0x22` packed together. I thought I was encoding 2.0 in every position. What I was actually doing was placing the nibble in the wrong bit positions. The hardware read each byte as `0b00100010`, extracted the nibble from bits 5-2, which gives `0b1000` — the encoding for 1.0, not 2.0. So the MMA computed 32 multiplications of 1.0 times 1.0 and returned 32.0. I was expecting 128.0 (32 times 2.0 times 2.0 with scale 1.0).
 
-The lesson: the FP4 container format is `00_SEEM_00` (sign, exponent, exponent, mantissa in bits 5-2). Get the shift wrong and the hardware silently interprets garbage.
+After staring at bit layouts for longer than I would like to admit, I realized the nibble was in the wrong position. Switching to `0x08080808`, which places the 1.0 nibble correctly in bits 5-2 of each byte, and setting scale to 1.0, the MMA returned 32.0 exactly. That is 32 multiply-accumulates of 1.0 times 1.0. Correct.
+
+The lesson: the FP4 container format is `00_SEMM_00` where the nibble occupies bits 5 through 2. Get the shift wrong and the hardware silently reads a different value with no error.
 
 ### The inline PTX
 
@@ -138,7 +142,7 @@ With `a0 = a1 = 0x08080808` (all 1.0), `b0 = 0x08080808` (all 1.0), and scales s
 ## 6. Encoding FP32 to FP4 E2M1
 
 Once the MMA worked with hardcoded constants, the next step was encoding arbitrary `float` values into FP4 E2M1 at runtime. The encoding function is covered in detail in a dedicated post on my [MXFP4 quantization kernel](https://florianmattana.com/posts/mxfp4_article/). 
-What follows here is a summary of the key points as they apply to this kernel.
+What follows here is a summary of the key points as they apply to this kernel. If you are already familiar with my previous article or have already experience with FP4 quantization, you can skip this section.
 
 ### The FP4 E2M1 format
 
@@ -255,9 +259,9 @@ The three building blocks worked in isolation. Encoding, scaling, MMA, all valid
 
 ### The first decision: how much shared memory
 
-My first attempt allocated two separate FP32 buffers in shared memory, one for Q and one for K. Each tile is 64 tokens times 128 dimensions = 8192 floats = 32 KB. Two of them: 64 KB. Add the quantized buffers and scales, and I was over 80 KB. That works on paper since the SM has 128 KB, but it means only one thread block per SM, and I had not even started thinking about the MMA accumulators eating into the register file.
+My first attempt allocated two separate FP32 buffers in shared memory, one for Q and one for K. Each tile is 64 tokens times 128 dimensions = 8192 floats = 32 KB. Two of them: 64 KB. Add the quantized buffers and scales, and I was over 80 KB, which exceeds the 99 KiB optin budget established in section 3.
 
-I realized Q and K are never needed in FP32 at the same time. Load Q as FP32, quantize it, then reuse the same buffer for K. One staging buffer instead of two. That brought shared memory down to about 50 KB:
+The fix was simple: Q and K are never needed in FP32 at the same time. Load Q as FP32, quantize it into `Q_quant`, then reuse the same staging buffer for K. One FP32 buffer instead of two. That brought the total down to about 49 KiB.
 
 | Buffer | Type | Size | Purpose |
 | --- | --- | --- | --- |
@@ -267,19 +271,26 @@ I realized Q and K are never needed in FP32 at the same time. Load Q as FP32, qu
 | `Q_scales` | uint8 | 256 B | One UE8M0 scale per 32 Q elements |
 | `K_scales` | uint8 | 256 B | One UE8M0 scale per 32 K elements |
 
-Still only one block per SM due to the register pressure from the accumulators, but at least I was not wasting shared memory.
+Still only one block per SM due to register pressure from the accumulators but the shared memory budget is now accounted for.
 
 ### The loading pattern that almost tripped me up
 
-128 threads need to load 8192 floats from VRAM into shared memory. The standard approach is a strided loop: each thread starts at its own index and jumps by 128 each iteration. Thread 0 loads elements 0, 128, 256, and so on. Thread 1 loads 1, 129, 257. This guarantees that on every iteration, consecutive threads read consecutive addresses, which is the definition of coalesced access.
+The kernel uses 128 threads per block: 4 warps of 32 threads each, where each warp is responsible for 16 rows of the output tile. That gives exactly 4 times 16 = 64 rows, matching the Q tile size. The thread count is a direct consequence of the MMA tile geometry, not an arbitrary choice.
 
-I initially wrote this with row/column indexing, computing `row = idx / Bd` and `col = idx % Bd` and then calculating the global address from there. It worked, but it was unnecessary complexity. Since Q is row-major and the tile is a contiguous block of rows, the linear index maps directly:
+Those 128 threads need to load 8192 floats from VRAM into shared memory. The standard approach is a strided loop: each thread starts at its own index and jumps by 128 each iteration. Thread 0 loads elements 0, 128, 256, and so on. Thread 1 loads 1, 129, 257. This guarantees that on every iteration, consecutive threads read consecutive addresses, which is the definition of coalesced access. A non-coalesced load would serialize the memory transactions and cost significant bandwidth.
 
-```cuda
-for (int k = 0; k < TILE_SIZE; k += NUM_THREADS) { int idx = tid + k; int g_idx = blockIdx.x * TILE_SIZE + idx; staging[idx] = Q[g_idx]; } __syncthreads();
+I initially wrote this with row and column indexing, computing `row = idx / Bd` and `col = idx % Bd` and then calculating the global address from there. It worked, but it was unnecessary complexity. Since Q is row-major and the tile is a contiguous block of rows, the linear index maps directly:
+
+```cpp
+for (int k = 0; k < TILE_SIZE; k += NUM_THREADS) {
+    int idx   = tid + k;
+    int g_idx = blockIdx.x * TILE_SIZE + idx;
+    staging[idx] = Q[g_idx];
+}
+__syncthreads();
 ```
 
-`blockIdx.x * TILE_SIZE` is the offset for this block's group of 64 tokens. No division, no modulo. I kept the row/column version in an early commit before realizing the simplification. Sometimes the clever approach is the dumb one.
+`blockIdx.x * TILE_SIZE` is the offset for this block's group of 64 tokens. No division, no modulo. Sometimes the clever approach is the dumb one.
 
 ### The quantization two-pass problem
 
