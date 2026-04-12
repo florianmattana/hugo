@@ -594,7 +594,7 @@ The kernel now processes attention over arbitrary key sequence lengths, in multi
 
 The attention formula is softmax(Q×Kᵀ / sqrt(d)) × V. The division by sqrt(d) was missing from the kernel until this point.
 
-Without it, the scores in S grow with the head dimension. Each score is a dot product of two vectors of length d. If Q and K have values around 1, the scores are on the order of sqrt(d) — for d=128, that is around 11. Feeding large values into softmax pushes it toward saturation: the maximum score gets a weight close to 1 and everything else collapses toward 0. The attention output becomes a near-copy of the V row corresponding to the single highest score, losing all the nuance of the weighted average.
+Without it, the scores in S grow with the head dimension. Each score is a dot product of two vectors of length d. If Q and K have values around 1, the scores are on the order of sqrt(d) for d=128, that is around 11. Feeding large values into softmax pushes it toward saturation: the maximum score gets a weight close to 1 and everything else collapses toward 0. The attention output becomes a near-copy of the V row corresponding to the single highest score, losing all the nuance of the weighted average.
 
 Dividing by sqrt(d) brings the scores back to order of magnitude 1 before the softmax, keeping the output distribution balanced.
 
