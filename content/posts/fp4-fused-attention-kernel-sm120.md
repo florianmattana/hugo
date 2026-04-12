@@ -575,8 +575,19 @@ Bit-exact. This confirms that the entire pipeline is correct: FP4 quantization, 
 
 The 0.81 cosine observed earlier with random inputs in [-1, 1] is the intrinsic precision cost of MXFP4 at `scale_vec::1X` granularity. FP4 E2M1 has only eight representable magnitudes. With one scale covering 32 elements, a single outlier sets the scale for the entire block and the remaining values lose resolution. The CPU reference operates on the original float32 values, so the comparison is unfair. The kernel is correct. The 0.81 is an architectural constraint, not a bug.
 
----
+## 17. The K Tile Loop
 
-*The kernel now correctly computes fused FP4 attention for a single Q tile against a single K tile, with the full score matrix living in registers throughout. What remains is extending K loading across multiple sequence tiles, adding asynchronous prefetching with `cp.async`, and extending V to use FP4 quantization for the second GEMM. The kernel is a work in progress — this article will be updated as those pieces come together.*
+The kernel validated in section 16 had one hard limitation: K was loaded from a hardcoded offset, meaning it only ever saw the first 64 tokens of the key sequence.
+For any real attention computation, K can have thousands of tokens. The kernel needed a loop.
+
+The change is conceptually simple. Instead of loading one K tile before the MMA loop, the outer structure becomes a loop over sequence tiles. For each tile, the kernel loads 64 rows of K into shared memory, quantizes them, runs the full MMA and softmax update, then moves to the next tile. The online softmax state — `m`, `l`, and `O` is declared before the loop and persists across all tiles. Each tile's scores are folded into the running state via the rescaling factor `alpha`.
+
+One detail worth noting: the V access index must account for the tile offset. When accumulating the attention output, the V row index is not just the local token position within the tile but `seq_tile * BQ + local_token`. Without that offset, every tile reads from the beginning of V regardless of which K tokens it just scored.
+
+A `__syncthreads()` at the end of each iteration ensures the staging buffer is free before the next tile's load overwrites it.
+
+Validation with two test cases confirms correctness. With `seq_k = 64` (single tile, regression test): cosine 1.0000. With `seq_k = 128` (two tiles, first real test of the loop): cosine 1.0000.
+
+The kernel now processes attention over arbitrary key sequence lengths, in multiples of 64 tokens.
 
 *Code: [github.com/florianmattana/fp4-fused-attention-sm120](https://github.com/florianmattana/fp4-fused-attention-sm120)*
