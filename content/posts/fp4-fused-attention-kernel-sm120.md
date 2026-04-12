@@ -22,7 +22,7 @@ The attention mechanism in transformers scales quadratically with sequence lengt
 
 That is roughly a 4x advantage going from FP16 to FP4, and since FP4 values are four times smaller, you also move four times less data through memory. On paper, that is a massive win for attention. If you can actually use the FP4 Tensor Cores.
 
-The problem is that nobody has done this yet on consumer Blackwell. Existing fused attention kernels like SageAttention3 and FlashAttention-4 target SM100 (datacenter Blackwell). They use instructions and hardware features (`tcgen05.mma`, Tensor Memory) that simply do not exist on SM120. If you try to compile them for `sm_120`, they either crash or fail silently.
+The problem is that nobody has done this yet on consumer Blackwell(except 5090), so it has to be done for RTX 5080, RTX 5070 Ti, RTX 5070, RTX 5060 Ti. Existing fused attention kernels like SageAttention3 and FlashAttention-4 target SM100 (datacenter Blackwell). They use instructions and hardware features (`tcgen05.mma`, Tensor Memory) that simply do not exist on SM120. If you try to compile them for `sm_120`, they won't be op[timized.
 
 There are non-fused FP4 kernels out there for this UC. For example [VincentKaufmann fp4-cuda-kernel](https://github.com/VincentKaufwormann/fp4-cuda-kernel) reaches about 143 TFLOPS. But non-fused means you compute QxK, write the full NxN score matrix to VRAM, read it back, apply softmax, write again, then compute the attention output. For 4096 tokens, that score matrix alone is 64 MB. On a 12 GB card, that is a dealbreaker.
 
@@ -59,9 +59,14 @@ Let me unpack that:
 - `f32.e2m1.e2m1.f32` -- FP32 accumulators, FP4 E2M1 inputs for both A and B matrices.
 - `ue8m0` -- the scale factor format (unsigned 8-bit exponent, no mantissa i.e., powers of two only).
 
-The register budget for one MMA call is roughly 7 registers per thread: 2 for the A fragment, 1 for B, and 4 for the FP32 accumulator. With my tile size of BQ=BK=64, I need about 50 registers per thread for the accumulators alone, which gives me around 85% SM occupancy. Going larger would blow the register file and kill occupancy. That is the binding constraint on this architecture.
+The register budget for one MMA call is roughly 7 registers per thread: 2 for the A fragment, 1 for B, and 4 for the FP32 accumulator. This assumption turned out to be wrong. The correct count is 10: 4 registers for A, 2 for B, and 4 for the accumulator. 
+Discovering that cost several weeks of debugging, and section 11 explains how.
 
-The fused kernel will process tiles of Q, K, V through shared memory (~9 KB out of the 128 KB available), while the score accumulators live permanently in registers. That is the core idea: shared memory for inputs, registers for intermediates, never touch global memory for the NxN attention matrix.
+The fused kernel will process tiles of Q, K, V through shared memory, roughly 9 KB by my initial estimate. That number turned out to be wrong in two ways.
+
+First, the actual shared memory usage ended up closer to 49 KiB once the full quantization pipeline was in place. Second, the available budget on SM120 is not 128 KB as I had assumed from the general Blackwell documentation, but 99 KiB. I found this while browsing open CUTLASS issues: [issue #3144](https://github.com/NVIDIA/cutlass/issues/3144), titled "StageCountAutoCarveout assumes max family SMEM, breaks SM121 (99 KiB vs SM120 228 KiB)", reporteda bug where CUTLASS was incorrectly assuming all SM12x GPUs share the same shared memory size. A contributor clarified in the thread that SM120 consumer Blackwell has 99 KiB, while SM100 datacenter Blackwell has 228 KiB. The distinction matters: at 49 KiB, the kernel fits within the 99 KiB optin budget, but only just.
+Yes it was a new GPU to me and when it is new do not forget to check with... nvidia-smi -q | grep "Max Shared Memory" .
+Section 7 covers the shared memory layout in detail.
 
 ## 4. Testing the MMA Instruction (and Everything That Went Wrong)
 
@@ -83,9 +88,10 @@ The lesson: the FP4 container format is `00_SEEM_00` (sign, exponent, exponent, 
 
 ### The inline PTX
 
-Here is the actual `asm volatile` block that calls the MMA:
+There is a reason this instruction appears as raw inline assembly rather than a clean C++ wrapper. The CUDA Core Compute Libraries (CCCL) expose `cuda::ptx` wrappers for many PTX instructions, which would normally be the right abstraction to use here. But at the time of writing, `cuda::ptx` does not provide wrappers for warp-level `mma.sync` on SM120. I exchanged with Federico Busato, who maintains CCCL at NVIDIA, on this exact gap. His read was that the wrappers would be useful but the decision was pending. I opened [CCCL issue #8146](https://github.com/NVIDIA/cccl/issues/8146) to track it. In the meantime, inline PTX is the only path.
+Here is the `asm volatile` block as I first wrote it:
 
-```cuda
+```cpp
 asm volatile(
     "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4"
     ".block_scale.scale_vec::1X.f32.e2m1.e2m1.f32.ue8m0"
@@ -103,13 +109,16 @@ asm volatile(
 );
 ```
 
+This version has two registers for A and one for B. It is wrong. The correct instruction requires four A registers and two B registers. This assumption cost several weeks of debugging and is corrected in section 11. The block above is shown as written at this stage because it compiled and passed the isolated MMA test described below. The test was not thorough enough to catch the error.
+
 The `"=f"` constraints are FP32 output registers, `"r"` are 32-bit integer input registers. The accumulator C is passed through as input (initialized to zero for the first call), and the result lands in D. The scale registers each pack four UE8M0 bytes into a single `uint32`.
 
 With `a0 = a1 = 0x08080808` (all 1.0), `b0 = 0x08080808` (all 1.0), and scales set to 1.0 (`0x7F7F7F7F`, since UE8M0 byte 127 = 2^0 = 1.0), the result was 32.0 in every accumulator lane. That is 32 multiply-accumulates of 1.0 x 1.0, which is exactly right.
 
 ## 5. Encoding FP32 to FP4 E2M1
 
-Once the MMA worked with hardcoded constants, the next step was encoding arbitrary `float` values into FP4 E2M1 at runtime.
+Once the MMA worked with hardcoded constants, the next step was encoding arbitrary `float` values into FP4 E2M1 at runtime. The encoding function is covered in detail in a dedicated post on my [MXFP4 quantization kernel](https://florianmattana.com/posts/mxfp4_article/). 
+What follows here is a summary of the key points as they apply to this kernel.
 
 ### The FP4 E2M1 format
 
