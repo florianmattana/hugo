@@ -711,6 +711,30 @@ The kernel is still latency-bound, but for a different reason. The shared memory
 
 ---
 
-*The kernel at this point is functionally complete and has been through one round of profiling-driven optimization. It computes fused FP4 attention correctly across arbitrary head dimensions, batch sizes, and sequence lengths. The gap to the 474 TFLOPS theoretical peak is real and documented. The next section covers the path toward closing it.*
+## 21. First Profiling Round: What We Tried and What We Learned
+
+Running NCU on the first functional version of the kernel revealed a single dominant metric: No Eligible at 95.23%. The warp scheduler found no eligible warp to execute 95% of the time. The SM was idle almost continuously.
+
+The cause was V. The V accumulation loop was reading directly from global memory inside a double loop over output column tiles and softmax weight indices. For HEAD_DIM=128 and a single n_tile, each thread generated 128 uncoalesced global memory accesses. Across 8 n_tiles and multiple seq_tiles, that amounted to thousands of scattered reads per block. The long scoreboard stall confirmed it at 81%.
+
+The fix was straightforward: load each V tile into shared memory before the MMA loop, exactly as K is already loaded. This eliminated the global memory dependency during accumulation. The result was roughly a 2x improvement in TFLOPS, and the kernel bandwidth jumped from ~50 GB/s to ~92 GB/s on the best configurations.
+
+That introduced a new constraint. Adding a 32 KB V tile to the shared memory budget brought the total to 80 KB per block. With 99 KiB available per SM on SM120, only one block could fit at a time. The occupancy stayed at 8.33% with four active warps per SM instead of the ~32 needed to hide latencies.
+
+The next move was to reduce the shared memory footprint. The staging buffer, used to load K as float32 before quantization, was the largest single consumer at 32 KB. By switching it from float32 to `__half`, the footprint dropped to 16 KB. The same buffer then gets reused for V, eliminating the need for a separate V tile buffer.
+
+The precision trade-off is negligible. FP16 has 10 bits of mantissa. FP4 E2M1 has 1. Any rounding introduced by the float32 → float16 → float32 conversion disappears completely in the FP4 quantization step. The test suite confirmed cosine 1.0000 on all configurations after the change.
+
+The shared memory budget dropped to ~32.5 KB, which should allow 3 blocks per SM instead of 1. The TFLOPS improved further, reaching 3.1 on head_dim=64, seq_k=1024.
+
+A comparison against PyTorch SDPA on identical configurations put the gap in perspective. PyTorch FP16 reaches 15 TFLOPS on the same hardware for the same
+problem size. We are at 3 TFLOPS, roughly 5x slower.
+
+The gap is not algorithmic. It is architectural. PyTorch SDPA via FlashAttention receives data already in FP16. No quantization happens inside the kernel. Our kernel quantizes Q, K, and V on the fly at every call, inside the main loop. The quantization pass `encode_fp4_e2m1` called 8192 times per tile, with a chain of
+eight comparisons per call takes roughly as long as the MMA itself. The Tensor Cores are idle most of the time, waiting for the quantization pass to finish.
+
+This is the fundamental tension of the current design. On-the-fly quantization keep sthe interface simple: the kernel accepts float32 inputs just like any standard
+attention kernel. But it means the FP4 Tensor Cores are not the bottleneck the scalar quantization loop is. Closing the gap with PyTorch requires either vectorizing the quantization, or moving it outside the kernel entirely and accepting pre-quantized inputs. Both directions are worth exploring, and that is where the next round of
+optimization begins.
 
 *Code: [github.com/florianmattana/fp4-fused-attention-sm120](https://github.com/florianmattana/fp4-fused-attention-sm120)*
