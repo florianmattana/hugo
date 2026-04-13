@@ -1,5 +1,5 @@
 ---
-title: "Building an FP4 Fused Attention Kernel on Consumer Blackwell (SM120) (WIP)"
+title: "Building an FP4 Fused Attention Kernel on Consumer Blackwell (SM120) "
 date: 2026-03-17
 draft: false
 tags: ["cuda", "blackwell", "sm120", "fp4", "attention", "tensor-cores"]
