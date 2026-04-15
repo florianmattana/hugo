@@ -135,7 +135,7 @@ My first attempt used `m16n8k64` and I reasoned that since FP4 values are 4 bits
 
 FP4 E2M1 encodes the value 1.0 as the 4-bit pattern `0b1000`. The container is an 8-bit byte, and the nibble must sit in bits 5-2, not bits 3-0. That means the correct byte for 1.0 is `0x08`: the pattern `0b00001000`, with the nibble in the upper half of the low byte. If you place the nibble in bits 3-0 instead, you get `0x02`, which the hardware reads as a completely different value.
 
-I initially filled every register with `0x22222222`, four bytes of `0x22` packed together. I thought I was encoding 2.0 in every position. What I was actually doing was placing the nibble in the wrong bit positions. The hardware read each byte as `0b00100010`, extracted the nibble from bits 5-2, which gives `0b1000` — the encoding for 1.0, not 2.0. So the MMA computed 32 multiplications of 1.0 times 1.0 and returned 32.0. I was expecting 128.0 (32 times 2.0 times 2.0 with scale 1.0).
+I initially filled every register with `0x22222222`, four bytes of `0x22` packed together. I thought I was encoding 2.0 in every position. What I was actually doing was placing the nibble in the wrong bit positions. The hardware read each byte as `0b00100010`, extracted the nibble from bits 5-2, which gives `0b1000` the encoding for 1.0, not 2.0. So the MMA computed 32 multiplications of 1.0 times 1.0 and returned 32.0. I was expecting 128.0 (32 times 2.0 times 2.0 with scale 1.0).
 
 After staring at bit layouts for longer than I would like to admit, I realized the nibble was in the wrong position. Switching to `0x08080808`, which places the 1.0 nibble correctly in bits 5-2 of each byte, and setting scale to 1.0, the MMA returned 32.0 exactly. That is 32 multiply-accumulates of 1.0 times 1.0. Correct.
 
@@ -164,7 +164,7 @@ asm volatile(
 );
 ```
 
-This version has two registers for A and one for B. It is wrong. The correct instruction requires four A registers and two B registers. This assumption cost several weeks of debugging and is corrected in section 11. The block above is shown as written at this stage because it compiled and passed the isolated MMA test described below. The test was not thorough enough to catch the error.
+This version has two registers for A and one for B. It is wrong. The correct instruction requires four A registers and two B registers. This debugging part is documented in section 11. The block above is shown as written at this stage because it compiled and passed the isolated MMA test described below. The test was not thorough enough to catch the error.
 
 The `"=f"` constraints are FP32 output registers, `"r"` are 32-bit integer input registers. The accumulator C is passed through as input (initialized to zero for the first call), and the result lands in D. The scale registers each pack four UE8M0 bytes into a single `uint32`.
 
@@ -236,7 +236,7 @@ End-to-end test: encode 1.0 into every position, pack, run MMA -> 32.0. Encode 2
 
 ## 7. Block Scaling: Why the Encoding Function Is Not Enough
 
-Here is the problem I ran into immediately: FP4 E2M1 maxes out at 6.0. If your input values are larger and in attention, they absolutely will be, everything above 5.0 clamps to 6.0 and you lose all relative differences. For example, `encode_fp4_e2m1(12.0f)` and `encode_fp4_e2m1(10.0f)` both return `0x1C` (6.0). That is catastrophic for attention scores where the relative ordering is everything.
+If you follow along with me, here is the problem you will run into immediately: FP4 E2M1 maxes out at 6.0. If your input values are larger and in attention, they absolutely will be, everything above 5.0 clamps to 6.0 and you lose all relative differences. For example, `encode_fp4_e2m1(12.0f)` and `encode_fp4_e2m1(10.0f)` both return `0x1C` (6.0). That is catastrophic for attention scores where the relative ordering is everything.
 
 ### The solution: block scaling
 
