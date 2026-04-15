@@ -119,14 +119,6 @@ scales       ▌                                  0.5 KB
 
 V is not in this table yet, and it is the same shape as K. Something has to give. Section 8 shows which buffers can share the same memory and which must coexist.
 
-The fused kernel will process tiles of Q, K, V through shared memory, roughly 9 KB by my initial estimate. That number turned out to be wrong in two ways.
-
-First, the actual shared memory usage ended up closer to 49 KiB once the full quantization pipeline was in place. Second, the available budget on SM120 is not 128 KB as I'd assumed from the general Blackwell documentation, but 99 KiB. I found this while browsing open CUTLASS issues: [issue #3144](https://github.com/NVIDIA/cutlass/issues/3144), titled "StageCountAutoCarveout assumes max family SMEM, breaks SM121 (99 KiB vs SM120 228 KiB)", reporteda bug where CUTLASS was incorrectly assuming all SM12x GPUs share the same shared memory size. A contributor clarified in the thread that SM120 consumer Blackwell has 99 KiB, while SM100 datacenter Blackwell has 228 KiB. The distinction matters: at 49 KiB, the kernel fits within the 99 KiB optin budget, but only just. 
-
-The distinction matters: at 49 KiB, the kernel fits within the 99 KiB optin budget but only just. On any new GPU, checking the actual shared memory limit with `nvidia-smi -q | grep "Max Shared Memory"` before making assumptions about the budget would have saved me time. Section 8 covers the shared memory layout in detail.
-
-Section 7 covers the shared memory layout in detail.
-
 ---
 
 ## 5. Testing the MMA Instruction (and Everything That Went Wrong)
