@@ -44,7 +44,7 @@ I considered three approaches:
 
 **Option C -- Patch an existing INT8 kernel.** Use the NVIDIA template library that powers CUTLASS. CuTe handles tile indexing, shared memory swizzling, and MMA dispatch through a compile-time algebra. SageAttention3 takes this path for its SM120 FP4 kernel. The trade-off is visibility: CuTe generates the correct PTX, but the fragment layout, the scale distribution across lanes, and the container bit packing are all resolved inside the templates. If something goes wrong, the debugging surface is the template instantiation stack, not the instruction. Since the goal of this project was to document exactly how the FP4 pipeline works at the instruction level, using CuTe would have hidden the very thing I was trying to see.
 
-I went with **Option A**. The trade-off is clear: more manual work, more room for bugs, but absolute certainty about where every value lives. For a fused kernel where the entire point is keeping data in registers, that certainty is worth it.
+I went with **Option A**. More manual work, more room for bugs, but every decision is visible in the code: which bytes go into which register, which lane reads which scale, how the nibble sits inside its container. That visibility is the point.
 
 ---
 
@@ -52,29 +52,27 @@ I went with **Option A**. The trade-off is clear: more manual work, more room fo
 
 Before writing a single line of code, it helps to map out the full problem.
 
-A fused FP4 attention kernel has to solve five things in sequence, and each one has a hardware dependency that constrains everything that follows.
+Attention takes three inputs: Q (what each token is looking for), K (what each token offers), and V (the content each token carries). The math is two matrix multiplies with a softmax in between: S = Q times K-transpose gives a score for every pair of tokens, softmax turns each row of S into a probability distribution, and O = softmax(S) times V produces a weighted average of the values. The fused kernel does all three without ever writing S to memory.
 
-**Load the input tiles.** Q, K, and V are too large to fit in registers. They live in global memory and must be loaded into shared memory tile by tile. The size of each tile is bounded by the shared memory budget per SM, which on SM120 turns out to be 99 KiB and not the 128 KiB I initially assumed.
+That requires solving five things in sequence, each constrained by the hardware.
 
-**Quantize on the fly.** The Tensor Core does not consume float32. Before running the matrix multiply, each tile must be converted to FP4 E2M1 and its block scale factors must be computed. This has to happen in shared memory, which means a two-pass approach: load the tile as float32 first, compute the scale, then encode.
+**Load the input tiles.** Q, K, and V live in global memory and must be brought into shared memory tile by tile. The tile size is bounded by the shared memory budget per SM, which on SM120 turns out to be 99 KiB, not the 128 KiB I initially assumed.
 
-**Run the matrix multiply in FP4.** The core operation is S = Q times K-transpose, computed with FP4 Tensor Cores. The score matrix S is 64 times 64 floats and must never be written to global memory.It lives entirely in registers across the warp throughout the computation. A warp is a group of 32 threads that execute together on the GPU, the fundamental unit of execution on Tensor Cores.
+**Quantize on the fly.** The Tensor Core does not consume float32. Each tile must be converted to FP4 E2M1 with block scale factors before the multiply. This forces a two-pass approach: load as float32, compute the scale, then encode.
 
-**Apply online softmax.** Softmax over a full row of S requires knowing the row maximum. But in the MMA output layout, each row is distributed across four threads. That forces a cross-thread reduction before every softmax step, using warp shuffle instructions.
+**Compute S = Q times K-transpose.** This is the first matrix multiply, executed on the FP4 Tensor Cores. The resulting score matrix is 64 times 64 floats, distributed across four warps of 32 threads each, entirely in registers. It never touches global memory.
 
-**Accumulate the output.** The final output O is computed as softmax(S) times V. This second matrix multiply accumulates incrementally as each column tile of S is processed, again never materializing the full score matrix.
+**Apply online softmax.** Softmax needs the row maximum, but the MMA output layout splits each row across four threads. That forces a cross-thread reduction via warp shuffle instructions before every softmax step.
 
-Each of these steps depends on knowing exactly which MMA instruction is available on SM120, what register layout it expects, and what quantization format it accepts.
+**Compute O = softmax(S) times V.** This is the second matrix multiply. It accumulates incrementally as each tile of K is processed, consuming the softmax output directly from the registers where S was just computed.
 
-That is what the next section is about.
+Each step depends on which MMA instruction SM120 actually supports, what register layout it expects, and what format it accepts. That is the next section.
 
 ---
 
 ## 4. Picking the Right MMA Instruction
 
-This is where I hit the first major wall. I started by reading the PTX ISA docs looking for FP4 MMA instructions on Blackwell. The datacenter SM100 chips use `tcgen05.mma`, a new-generation instruction that operates on large tiles and uses a dedicated hardware unit called Tensor Memory. I assumed SM120 would have something similar.
-
-It does not.
+This is where I hit the first major wall. I started by reading the [PTX ISA docs](https://docs.nvidia.com/cuda/parallel-thread-execution/) looking for FP4 MMA instructions on Blackwell. The datacenter SM100 chips use `tcgen05.mma`, an instruction that operates on large tiles and uses a dedicated hardware unit called Tensor Memory. We could assumed that all Blackwell arch including SM120 would have something similar but it does not.
 
 After digging through [CUTLASS issue #2800](https://github.com/NVIDIA/cutlass/issues/2800), a [thread on the NVIDIA developer forums](https://forums.developer.nvidia.com/), and [CUTLASS issue #3044](https://github.com/NVIDIA/cutlass/issues/3044), I pieced together the reality: SM120 uses the older Ampere-style **warp-level `mma.sync`** instructions. No Tensor Memory, no `tcgen05`. The specific instruction I need is:
 
