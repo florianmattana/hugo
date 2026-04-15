@@ -38,7 +38,7 @@ This article documents the full process of building that kernel from scratch usi
 
 I considered three approaches:
 
-**Option A -- Inline PTX.** Write the kernel in CUDA C++ and embed the Tensor Core MMA instructions as inline PTX assembly. This gives full control over register allocation, meaning I can guarantee the score matrix stays in registers.
+**Option A -- Inline PTX.** Write the kernel in CUDA C++ and embed the Tensor Core MMA instructions as inline PTX assembly. Each register is named in the asm volatile block, each byte is packed by hand, each scale is assigned to a specific lane. When something goes wrong, the debugging surface is the instruction itself, not a template instantiation stack. That visibility is why this article exists.
 
 **Option B -- CuTe (CUTLASS 3.x).** Use the NVIDIA template library that powers CUTLASS. CuTe handles tile indexing, shared memory swizzling, and MMA dispatch through a compile-time algebra. SageAttention3 takes this path for its SM120 FP4 kernel. The trade-off is visibility: CuTe generates the correct PTX, but the fragment layout, the scale distribution across lanes, and the container bit packing are all resolved inside the templates. If something goes wrong, the debugging surface is the template instantiation stack, not the instruction. Since the goal of this project was to document exactly how the FP4 pipeline works at the instruction level, using CuTe would have hidden the very thing I was trying to see.
 
@@ -80,15 +80,28 @@ After digging through [CUTLASS issue #2800](https://github.com/NVIDIA/cutlass/is
 
 Let me unpack that:
 
-- `mma.sync.aligned` -- warp-synchronous, all 32 threads participate.
-- `kind::mxf8f6f4` -- the MX (microscaling) family that covers FP4/FP6/FP8.
-- `block_scale.scale_vec::1X` -- each group of 32 FP4 values shares one 8-bit scale factor. I initially tried `scale_vec::2X` (one scale per 16 values, finer granularity) but it does not compile on SM120. Only 1X is supported, which means 6.25% overhead for the scale factors.
-- `m16n8k32` -- tile shape: 16 rows x 8 columns, with K=32 (32 FP4 values along the reduction dimension per instruction).
-- `f32.e2m1.e2m1.f32` -- FP32 accumulators, FP4 E2M1 inputs for both A and B matrices.
-- `ue8m0` -- the scale factor format (unsigned 8-bit exponent, no mantissa i.e., powers of two only).
+- `mma.sync.aligned` : warp-synchronous, all 32 threads participate.
+- `kind::mxf8f6f4` : the MX (microscaling) family that covers FP4/FP6/FP8.
+- `block_scale.scale_vec::1X` : each group of 32 FP4 values shares one 8-bit scale factor. I initially tried `scale_vec::2X` (one scale per 16 values, finer granularity) but it does not compile on SM120. Only 1X is supported, which means 6.25% overhead for the scale factors.
+- `m16n8k32` : tile shape: 16 rows x 8 columns, with K=32 (32 FP4 values along the reduction dimension per instruction).
+- `f32.e2m1.e2m1.f32` : FP32 accumulators, FP4 E2M1 inputs for both A and B matrices.
+- `ue8m0` : the scale factor format (unsigned 8-bit exponent, no mantissa i.e., powers of two only).
 
-The register budget for one MMA call is roughly 7 registers per thread: 2 for the A fragment, 1 for B, and 4 for the FP32 accumulator. This assumption turned out to be wrong. The correct count is 10: 4 registers for A, 2 for B, and 4 for the accumulator. 
-Discovering that cost several weeks of debugging, and section 11 explains how.
+The register budget for one MMA call was roughly 7 registers per thread: 2 for the A fragment, 1 for B, and 4 for the FP32 accumulator. This assumption turned out to be wrong. The correct count was actually 10: 4 registers for A, 2 for B, and 4 for the accumulator. 
+Discovering that cost a bit of time of debugging, and section 11 explains how.
+
+===
+The shared memory budget is worth computing on paper before writing any code. Start with the tile dimensions and count the bytes at each stage:
+| Buffer | Shape | Element size | Total |
+| --- | --- | --- | --- |
+| Q staging | 64 × 128 | 4 B (float32) | 32 KB |
+| K staging | 64 × 128 | 4 B (float32) | 32 KB |
+| Q quantized | 64 × 128 | 1 B (uint8) | 8 KB |
+| K quantized | 64 × 128 | 1 B (uint8) | 8 KB |
+| Q scales | 8192 / 32 = 256 | 1 B (ue8m0) | 256 B |
+| K scales | 8192 / 32 = 256 | 1 B (ue8m0) | 256 B |
+If Q and K are staged as float32 at the same time, that is 64 KB before even counting the quantized buffers. SM120 gives you 99 KiB with the optin path. The budget is already tight, and V is not in it yet. The design has to account for which buffers can be reused and which must coexist. Section 8 covers the final layout.
+===
 
 The fused kernel will process tiles of Q, K, V through shared memory, roughly 9 KB by my initial estimate. That number turned out to be wrong in two ways.
 
