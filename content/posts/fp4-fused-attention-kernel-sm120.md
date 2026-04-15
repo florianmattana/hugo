@@ -294,19 +294,32 @@ The three building blocks worked in isolation. Encoding, scaling, MMA, all valid
 
 ### The first decision: how much shared memory
 
-My first attempt allocated two separate FP32 buffers in shared memory, one for Q and one for K. Each tile is 64 tokens times 128 dimensions = 8192 floats = 32 KB. Two of them: 64 KB. Add the quantized buffers and scales, and I was over 80 KB, which exceeds the 99 KiB optin budget established in section 3.
+Section 4 laid out the budget: if Q and K staging buffers are live at the same time, that is 80.5 KB before V. Too much.
 
-The fix was simple: Q and K are never needed in FP32 at the same time. Load Q as FP32, quantize it into `Q_quant`, then reuse the same staging buffer for K. One FP32 buffer instead of two. That brought the total down to about 49 KiB.
+The fix is simple. Q and K are never needed in FP32 at the same time. Load Q as FP32, quantize it into `Q_quant`, then reuse the same staging buffer for K. One 32 KB buffer instead of two:
 
 | Buffer | Type | Size | Purpose |
 | --- | --- | --- | --- |
-| `staging` | float | 32,768 B | Reusable FP32 buffer for loading from VRAM |
+| `staging` | float | 32,768 B | Reusable FP32 buffer for Q then K |
 | `Q_quant` | uint8 | 8,192 B | Q tile after FP4 quantization |
 | `K_quant` | uint8 | 8,192 B | K tile after FP4 quantization |
 | `Q_scales` | uint8 | 256 B | One UE8M0 scale per 32 Q elements |
 | `K_scales` | uint8 | 256 B | One UE8M0 scale per 32 K elements |
 
-Still only one block per SM due to register pressure from the accumulators but the shared memory budget is now accounted for.
+```text
+SM120 shared memory budget (optin): 99 KiB
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 99 KiB
+
+staging      ████████████████████████████████  32 KB  (reused for Q then K)
+Q quantized  ████████                           8 KB
+K quantized  ████████                           8 KB
+scales       ▌                                  0.5 KB
+                                         total: 48.5 KB  ← fits, with room for V later
+```
+
+The 99 KiB number is not from the Blackwell marketing docs. I found it while browsing [CUTLASS issue #3144](https://github.com/NVIDIA/cutlass/issues/3144), where a contributor clarified that SM120 consumer Blackwell has 99 KiB of shared memory per SM, while SM100 datacenter Blackwell has 228 KiB. The distinction matters: at 48.5 KB the kernel fits, but adding V later will push the budget close to the limit. On any new GPU, checking the actual shared memory with `nvidia-smi -q | grep "Max Shared Memory"` before designing the layout would have saved me time.
+
+Still only one block per SM due to register pressure from the accumulators, but the shared memory budget is now accounted for.
 
 ### The loading pattern that almost tripped me up
 
