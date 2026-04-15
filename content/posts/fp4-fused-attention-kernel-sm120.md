@@ -101,9 +101,23 @@ The shared memory budget is worth computing on paper before writing any code. St
 | Q scales | 256 entries | 1 B (ue8m0) | 256 B |
 | K scales | 256 entries | 1 B (ue8m0) | 256 B |
 
-*Scale count: each tile has 64 × 128 = 8192 elements. One scale per block of 32 gives 256 scales.*
+*Scale count: each tile has 64 × 128 = 8,192 elements. One scale per block of 32 gives 256 scales.*
 
-If Q and K staging buffers are live at the same time, that is 64 KB before the quantized buffers are even counted. SM120 gives you 99 KiB with the optin path, and V is not in this table yet. Something has to give. Section 8 shows which buffers can share the same memory and which must coexist.
+If all buffers are live at the same time:
+
+```text
+SM120 shared memory budget (optin): 99 KiB
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 99 KiB
+
+Q staging    ████████████████████████████████  32 KB
+K staging    ████████████████████████████████  32 KB
+Q quantized  ████████                           8 KB
+K quantized  ████████                           8 KB
+scales       ▌                                  0.5 KB
+                                         total: 80.5 KB  ← no room for V
+```
+
+V is not in this table yet, and it is the same shape as K. Something has to give. Section 8 shows which buffers can share the same memory and which must coexist.
 
 The fused kernel will process tiles of Q, K, V through shared memory, roughly 9 KB by my initial estimate. That number turned out to be wrong in two ways.
 
