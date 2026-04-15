@@ -90,18 +90,20 @@ Let me unpack that:
 The register budget for one MMA call was roughly 7 registers per thread: 2 for the A fragment, 1 for B, and 4 for the FP32 accumulator. This assumption turned out to be wrong. The correct count was actually 10: 4 registers for A, 2 for B, and 4 for the accumulator. 
 Discovering that cost a bit of time of debugging, and section 11 explains how.
 
-===
 The shared memory budget is worth computing on paper before writing any code. Start with the tile dimensions and count the bytes at each stage:
+
 | Buffer | Shape | Element size | Total |
 | --- | --- | --- | --- |
-| Q staging | 64 × 128 | 4 B (float32) | 32 KB |
-| K staging | 64 × 128 | 4 B (float32) | 32 KB |
-| Q quantized | 64 × 128 | 1 B (uint8) | 8 KB |
-| K quantized | 64 × 128 | 1 B (uint8) | 8 KB |
-| Q scales | 8192 / 32 = 256 | 1 B (ue8m0) | 256 B |
-| K scales | 8192 / 32 = 256 | 1 B (ue8m0) | 256 B |
-If Q and K are staged as float32 at the same time, that is 64 KB before even counting the quantized buffers. SM120 gives you 99 KiB with the optin path. The budget is already tight, and V is not in it yet. The design has to account for which buffers can be reused and which must coexist. Section 8 covers the final layout.
-===
+| Q staging | 64 × 128 | 4 B (float32) | 32,768 B |
+| K staging | 64 × 128 | 4 B (float32) | 32,768 B |
+| Q quantized | 64 × 128 | 1 B (uint8) | 8,192 B |
+| K quantized | 64 × 128 | 1 B (uint8) | 8,192 B |
+| Q scales | 256 entries | 1 B (ue8m0) | 256 B |
+| K scales | 256 entries | 1 B (ue8m0) | 256 B |
+
+*Scale count: each tile has 64 × 128 = 8192 elements. One scale per block of 32 gives 256 scales.*
+
+If Q and K staging buffers are live at the same time, that is 64 KB before the quantized buffers are even counted. SM120 gives you 99 KiB with the optin path, and V is not in this table yet. Something has to give. Section 8 shows which buffers can share the same memory and which must coexist.
 
 The fused kernel will process tiles of Q, K, V through shared memory, roughly 9 KB by my initial estimate. That number turned out to be wrong in two ways.
 
