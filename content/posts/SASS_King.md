@@ -217,6 +217,110 @@ The two FP16 immediates `{1.875, 0.00931549}` happen to have the combined 32-bit
 
 **Insight 4: watch for division and transcendentals**. You did not see `CALL.REL.NOINC` in kernels 01 to 04 because there were no divisions or math library calls. If you see `CALL` in a kernel that should be straight-line arithmetic, you have inadvertently triggered a slowpath. Division of variable integers is the most common culprit. Use `__fdividef` (approximate division) or shift-and-mask when possible.
 
+# NVIDIA SASS Special Registers (SR)
+
+Special registers are read only registers maintained by the hardware. They are accessed via `S2R` (per thread destination) or `S2UR` (uniform destination). The register name in the SASS dump may appear as the symbolic name (`SR_TID.X`) or the numeric index (`SR33`), depending on the disassembler and version.
+
+## Per thread special registers
+
+These vary across the threads of a warp.
+
+| Index | Symbolic name | Content |
+|---|---|---|
+| SR0 | SR_LANEID | Lane ID within the warp (0 to 31) |
+| SR1 | SR_CLOCK | Cycle counter (lower 32 bits) |
+| SR2 | SR_VIRTCFG | Virtual configuration |
+| SR3 | SR_VIRTID | Virtual ID |
+| SR8 | SR_PM0 | Performance counter 0 |
+| SR9 | SR_PM1 | Performance counter 1 |
+| SR10 | SR_PM2 | Performance counter 2 |
+| SR11 | SR_PM3 | Performance counter 3 |
+| SR12 | SR_PM4 | Performance counter 4 |
+| SR13 | SR_PM5 | Performance counter 5 |
+| SR14 | SR_PM6 | Performance counter 6 |
+| SR15 | SR_PM7 | Performance counter 7 |
+| SR16 | SR_ORDERING_TICKET | Memory ordering ticket |
+| SR32 | SR_PRIM_TYPE | Primitive type (graphics) |
+| SR33 | SR_TID.X | threadIdx.x |
+| SR34 | SR_TID.Y | threadIdx.y |
+| SR35 | SR_TID.Z | threadIdx.z |
+| SR36 | SR_CTA_PARAM | CTA parameter |
+| SR37 | SR_CTAID.X | blockIdx.x |
+| SR38 | SR_CTAID.Y | blockIdx.y |
+| SR39 | SR_CTAID.Z | blockIdx.z |
+| SR40 | SR_NTID.X | blockDim.x |
+| SR41 | SR_NTID.Y | blockDim.y |
+| SR42 | SR_NTID.Z | blockDim.z |
+| SR43 | SR_GRIDPARAM | Grid parameter |
+| SR44 | SR_NCTAID.X | gridDim.x |
+| SR45 | SR_NCTAID.Y | gridDim.y |
+| SR46 | SR_NCTAID.Z | gridDim.z |
+| SR48 | SR_SWINLO | Shared window low (SMEM base low) |
+| SR49 | SR_SWINSZ | Shared window size |
+| SR50 | SR_SMEMSZ | Shared memory size |
+| SR51 | SR_SMEMBANKCFG | Shared memory bank configuration |
+| SR52 | SR_LWINLO | Local window low (LMEM base low) |
+| SR53 | SR_LWINSZ | Local window size |
+| SR54 | SR_LMEMLOSZ | Local memory low size |
+| SR55 | SR_LMEMHIOFF | Local memory high offset |
+| SR56 | SR_EQMASK | Equality mask (active threads with same value) |
+| SR57 | SR_LTMASK | Less than mask |
+| SR58 | SR_LEMASK | Less or equal mask |
+| SR59 | SR_GTMASK | Greater than mask |
+| SR60 | SR_GEMASK | Greater or equal mask |
+| SR61 | SR_REGALLOC | Register allocation info |
+| SR62 | SR_BARRIERALLOC | Barrier allocation info |
+| SR64 | SR_GLOBALERRORSTATUS | Global error status |
+| SR66 | SR_WARPERRORSTATUS | Warp error status |
+| SR67 | SR_WARPERRORSTATUSCLEAR | Warp error status clear |
+| SR79 | SR_PM_HI0 | Performance counter 0 high |
+| SR80 | SR_PM_HI1 | Performance counter 1 high |
+| SR81 | SR_PM_HI2 | Performance counter 2 high |
+| SR82 | SR_PM_HI3 | Performance counter 3 high |
+| SR83 | SR_PM_HI4 | Performance counter 4 high |
+| SR84 | SR_PM_HI5 | Performance counter 5 high |
+| SR85 | SR_PM_HI6 | Performance counter 6 high |
+| SR86 | SR_PM_HI7 | Performance counter 7 high |
+| SR80 | SR_CLOCKLO | Clock low (32 bit cycle counter) |
+| SR81 | SR_CLOCKHI | Clock high |
+| SR82 | SR_GLOBALTIMERLO | Global timer low (nanoseconds) |
+| SR83 | SR_GLOBALTIMERHI | Global timer high |
+| SR99 | SR_HWTASKID | Hardware task ID |
+| SR100 | SR_CIRCULARQUEUEENTRYINDEX | Circular queue entry index |
+| SR101 | SR_CIRCULARQUEUEENTRYADDRESSLOW | Circular queue address low |
+| SR102 | SR_CIRCULARQUEUEENTRYADDRESSHIGH | Circular queue address high |
+
+## Uniform special registers
+
+Same value across all threads of the warp. Read via `S2UR` into a UR.
+
+| Index | Symbolic name | Content |
+|---|---|---|
+| SR37 | SR_CTAID.X | blockIdx.x (uniform: same for all threads of the block) |
+| SR38 | SR_CTAID.Y | blockIdx.y |
+| SR39 | SR_CTAID.Z | blockIdx.z |
+| SR40 | SR_NTID.X | blockDim.x |
+| SR41 | SR_NTID.Y | blockDim.y |
+| SR42 | SR_NTID.Z | blockDim.z |
+| SR44 | SR_NCTAID.X | gridDim.x |
+| SR45 | SR_NCTAID.Y | gridDim.y |
+| SR46 | SR_NCTAID.Z | gridDim.z |
+
+Note: indices that appear in both tables (like SR37) are uniform values that the compiler may read either via S2R into an R or via S2UR into a UR depending on how the value will be used downstream. In practice ptxas defaults to S2UR for these to save register pressure.
+
+## Read latency
+
+Special registers have variable latency. The S2R or S2UR instruction emits a stall count and sets a scoreboard:
+
+| Register class | Approximate latency (SM120, hypothesis) |
+|---|---|
+| SR_TID, SR_CTAID, SR_NTID, SR_NCTAID, SR_LANEID | Fast, around 20 to 50 cycles |
+| SR_CLOCKLO, SR_CLOCKHI | Slow, possibly 100+ cycles |
+| SR_GLOBALTIMERLO, SR_GLOBALTIMERHI | Slow, queries a global counter |
+| SR_PM* (performance counters) | Variable, can be slow |
+
+Latency depends on contention and is not deterministic. ptxas always uses a scoreboard for S2R and S2UR to ensure correctness.
+
 ### The general diagnostic workflow
 
 Putting it together, here is the sequence to use when opening a SASS dump for performance work:
@@ -286,3 +390,14 @@ Long-term: a complete instruction-level reference for each architecture, and a c
 - [gpuasm.com](https://gpuasm.com/). The tool that makes this work possible.
 
 Source code for all kernels lives at [github.com/florianmattana/sass-king](https://github.com/florianmattana/sass-king). Per-kernel detailed analyses are available as separate posts in this series.
+
+## Source
+
+Cross referenced from:
+- NVIDIA cuda-binary-utilities documentation (Blackwell ISA, Table 8)
+- 0xD0GF00D/DocumentSASS community reference
+- Observed names in `cuobjdump --dump-sass` output on SM120
+
+Some indices (especially in the SR60+ range) are partially documented or undocumented and may differ between architectures.
+
+
