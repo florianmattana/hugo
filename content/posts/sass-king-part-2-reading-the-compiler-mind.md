@@ -1,7 +1,7 @@
 ---
 title: "SASS King, Part 2: Reading the Compiler's Mind"
 date: 2026-05-08
-draft: true
+draft: false
 description: "How studying SASS taught me to identify ptxas heuristic decisions, understand their logic, and explore where the compiled binary diverges from source-level intent."
 tags: ["cuda", "sass", "gpu", "nvidia", "reverse-engineering", "sm120", "blackwell", "ptxas"]
 categories: ["SASS King"]
